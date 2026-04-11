@@ -275,19 +275,202 @@ function Services({ data, onScale, onRestart, onLogs, onTasks }) {
   </>;
 }
 
-// Stacks
-function Stacks({ data, onRemove }) {
+// Stacks — full Portainer-style management
+function Stacks({ data, onRemove, toast }) {
+  const [selected, setSelected] = useState(null); // selected stack name
+  const [detail, setDetail] = useState(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [compose, setCompose] = useState(null);
+  const [composeLoading, setComposeLoading] = useState(false);
+  const [stackLogs, setStackLogs] = useState(null);
+  const [logsLoading, setLogsLoading] = useState(false);
+  const [activeView, setActiveView] = useState('services'); // services|compose|logs|env
+  const [deployModal, setDeployModal] = useState(false);
+  const [deployName, setDeployName] = useState('');
+  const [deployYaml, setDeployYaml] = useState('');
+  const [deploying, setDeploying] = useState(false);
+
+  const selectStack = async (name) => {
+    setSelected(name); setActiveView('services'); setDetail(null); setCompose(null); setStackLogs(null);
+    setDetailLoading(true);
+    const d = await api(`stack-detail?name=${encodeURIComponent(name)}`);
+    setDetail(d); setDetailLoading(false);
+  };
+
+  const loadCompose = async () => {
+    setComposeLoading(true);
+    const d = await api(`stack-compose?name=${encodeURIComponent(selected)}`);
+    setCompose(d); setComposeLoading(false);
+  };
+
+  const loadLogs = async () => {
+    setLogsLoading(true);
+    const d = await api(`stack-logs?name=${encodeURIComponent(selected)}&tail=100`);
+    setStackLogs(d); setLogsLoading(false);
+  };
+
+  const doDeploy = async () => {
+    if (!deployName || !deployYaml) return;
+    setDeploying(true);
+    const r = await api('stack-deploy', {method:'POST', body:{stack_name:deployName, compose_yaml:deployYaml}});
+    setDeploying(false);
+    if (r.success) { toast('Stack desplegado','success'); setDeployModal(false); setDeployName(''); setDeployYaml(''); }
+    else toast(r.error||'Error','error');
+  };
+
+  const doRedeploy = async (name) => {
+    if (!compose?.compose) { toast('Carga el compose primero','error'); return; }
+    if (!confirm(`Redesplegar stack ${name}? Esto actualizara los servicios.`)) return;
+    const r = await api('stack-deploy', {method:'POST', body:{stack_name:name, compose_yaml:compose.compose}});
+    if (r.success) { toast(`Stack ${name} redesplegado`,'success'); selectStack(name); }
+    else toast(r.error||'Error','error');
+  };
+
   if (!data || !data.length) return <div className="card" style={{padding:20,color:'var(--muted)'}}>Sin stacks</div>;
-  return <div className="card">
-    <table>
-      <thead><tr><th>Stack</th><th>Services</th><th>Acciones</th></tr></thead>
-      <tbody>{data.map((s,i) => <tr key={i}>
-        <td><strong>{s.Name}</strong></td>
-        <td>{s.Services}</td>
-        <td><button className="btn btn-sm btn-danger" onClick={()=>onRemove(s.Name)}>Remove</button></td>
-      </tr>)}</tbody>
-    </table>
-  </div>;
+
+  // Stack detail view
+  if (selected && detail) {
+    const svcs = detail.services || [];
+    const totalRunning = svcs.reduce((acc,s) => {
+      const r = (s.Replicas||'').split('/');
+      return acc + (parseInt(r[0])||0);
+    }, 0);
+    const totalDesired = svcs.reduce((acc,s) => {
+      const r = (s.Replicas||'').split('/');
+      return acc + (parseInt(r[1]||r[0])||0);
+    }, 0);
+    const healthy = totalRunning === totalDesired && totalDesired > 0;
+
+    return <>
+      <div style={{display:'flex',alignItems:'center',gap:12,marginBottom:16}}>
+        <button className="btn btn-sm" onClick={()=>{setSelected(null);setDetail(null);}}>← Volver</button>
+        <h3 style={{fontSize:16,fontWeight:700}}>{selected}</h3>
+        <span className={`badge ${healthy?'badge-green':'badge-yellow'}`}>{healthy?'Healthy':'Degraded'}</span>
+        <span className="badge badge-blue">{svcs.length} servicios</span>
+        <span style={{fontSize:12,color:'var(--muted)'}}>{totalRunning}/{totalDesired} replicas</span>
+      </div>
+
+      <div className="tabs">
+        <div className={`tab ${activeView==='services'?'active':''}`} onClick={()=>setActiveView('services')}>Servicios ({svcs.length})</div>
+        <div className={`tab ${activeView==='compose'?'active':''}`} onClick={()=>{setActiveView('compose');if(!compose)loadCompose();}}>Compose</div>
+        <div className={`tab ${activeView==='logs'?'active':''}`} onClick={()=>{setActiveView('logs');loadLogs();}}>Logs</div>
+        <div className={`tab ${activeView==='env'?'active':''}`} onClick={()=>setActiveView('env')}>Variables</div>
+        <div style={{marginLeft:'auto',display:'flex',gap:6}}>
+          {compose && <button className="btn btn-sm btn-primary" onClick={()=>doRedeploy(selected)}>Redeploy</button>}
+          <button className="btn btn-sm btn-danger" onClick={()=>{onRemove(selected);setSelected(null);}}>Remove Stack</button>
+        </div>
+      </div>
+
+      {activeView==='services' && <div className="card fade-in" style={{overflowX:'auto'}}>
+        <table>
+          <thead><tr><th>Servicio</th><th>Image</th><th>Replicas</th><th>Puertos</th><th>Estado Tasks</th><th>Acciones</th></tr></thead>
+          <tbody>{svcs.map((s,i) => {
+            const img = (s.image_full || s.Image || '').split('/').pop();
+            const tasks = s.tasks || [];
+            const running = tasks.filter(t=>(t.CurrentState||'').toLowerCase().startsWith('running')).length;
+            const failed = tasks.filter(t=>(t.CurrentState||'').toLowerCase().includes('failed')).length;
+            const ports = (s.ports_detail||[]).map(p=>`${p.PublishedPort||''}:${p.TargetPort||''}`).filter(p=>p!==':').join(', ');
+            return <tr key={i}>
+              <td><strong>{(s.Name||'').replace(selected+'_','')}</strong><div style={{fontSize:11,color:'var(--muted)',fontFamily:'monospace'}}>{s.Name}</div></td>
+              <td style={{fontSize:12,maxWidth:200,overflow:'hidden',textOverflow:'ellipsis'}} title={s.image_full}>{img}</td>
+              <td><span style={{fontWeight:600,color:running>0?'var(--green)':'var(--red)'}}>{s.Replicas}</span>{s.mode_type==='global'&&<span className="badge badge-muted" style={{marginLeft:4}}>global</span>}</td>
+              <td style={{fontSize:12,fontFamily:'monospace'}}>{ports||'-'}</td>
+              <td>
+                <div style={{display:'flex',gap:4}}>
+                  {running>0&&<span className="badge badge-green">{running} running</span>}
+                  {failed>0&&<span className="badge badge-red">{failed} failed</span>}
+                  {tasks.length===0&&<span className="badge badge-muted">no tasks</span>}
+                </div>
+              </td>
+              <td style={{whiteSpace:'nowrap'}}>
+                <button className="btn btn-sm" onClick={async()=>{const r=await api('service-restart',{method:'POST',body:{service_id:s.Name}});if(r.success){toast(s.Name+' reiniciado','success');selectStack(selected);}else toast(r.error,'error');}}>Restart</button>{' '}
+                {s.mode_type!=='global'&&<button className="btn btn-sm" onClick={()=>{const n=prompt('Replicas:',s.Replicas?.split('/').pop()||'1');if(n!==null)api('service-scale',{method:'POST',body:{service_id:s.Name,replicas:parseInt(n)}}).then(r=>{if(r.success){toast('Escalado','success');selectStack(selected);}else toast(r.error,'error');});}}>Scale</button>}
+              </td>
+            </tr>;
+          })}</tbody>
+        </table>
+      </div>}
+
+      {activeView==='compose' && <div className="card fade-in">
+        {composeLoading ? <div style={{textAlign:'center',padding:30}}><span className="spinner"/></div> : compose ? <>
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8}}>
+            <span style={{fontSize:12,color:'var(--muted)'}}>Fuente: {compose.source==='stack-config'?'docker stack config':'Reconstruido desde inspects'}</span>
+            <button className="btn btn-sm" onClick={()=>{navigator.clipboard.writeText(compose.compose);toast('Copiado al portapapeles','success');}}>Copiar</button>
+          </div>
+          <textarea value={compose.compose} onChange={e=>setCompose({...compose,compose:e.target.value})} style={{fontFamily:'monospace',fontSize:12,minHeight:400,background:'#000',color:'#0f0',padding:12,borderRadius:8,width:'100%',border:'1px solid var(--border)',resize:'vertical'}} />
+        </> : <div style={{color:'var(--muted)'}}>Error cargando compose</div>}
+      </div>}
+
+      {activeView==='logs' && <div className="card fade-in">
+        {logsLoading ? <div style={{textAlign:'center',padding:30}}><span className="spinner"/></div>
+          : <><div style={{marginBottom:8,fontSize:12,color:'var(--muted)'}}>{stackLogs?.services||0} servicios · <button className="btn btn-sm" onClick={loadLogs}>Actualizar</button></div>
+            <div className="log-viewer">{stackLogs?.logs||'Sin logs'}</div></>}
+      </div>}
+
+      {activeView==='env' && <div className="card fade-in">
+        <h4 style={{fontSize:13,color:'var(--muted)',marginBottom:12}}>Variables de entorno por servicio</h4>
+        {svcs.map((s,i) => {
+          const envVars = s.env_vars || [];
+          if (!envVars.length) return null;
+          return <div key={i} style={{marginBottom:16}}>
+            <h5 style={{fontSize:13,fontWeight:600,marginBottom:6}}>{(s.Name||'').replace(selected+'_','')}<span style={{color:'var(--muted)',fontWeight:400}}> ({envVars.length} vars)</span></h5>
+            <div style={{background:'var(--bg)',borderRadius:6,padding:8,fontSize:12,fontFamily:'monospace',maxHeight:200,overflow:'auto'}}>
+              {envVars.map((e,j)=>{
+                const [k,...v]=e.split('=');
+                const val=v.join('=');
+                const isSensitive=/password|secret|key|token|api_key/i.test(k);
+                return <div key={j} style={{padding:'2px 0',borderBottom:'1px solid var(--border)'}}>
+                  <span style={{color:'var(--blue)'}}>{k}</span>=<span style={{color:isSensitive?'var(--red)':'var(--green)'}}>{isSensitive?'••••••••':val}</span>
+                </div>;
+              })}
+            </div>
+          </div>;
+        })}
+        {svcs.every(s=>!(s.env_vars||[]).length) && <div style={{color:'var(--muted)'}}>No hay variables de entorno configuradas</div>}
+      </div>}
+
+      {detail.networks && detail.networks.length>0 && activeView==='services' && <div className="card" style={{marginTop:12}}>
+        <h4 style={{fontSize:13,color:'var(--muted)',marginBottom:8}}>Redes del Stack</h4>
+        <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+          {detail.networks.map((n,i)=><span key={i} className="badge badge-blue">{n.Name} ({n.Driver})</span>)}
+        </div>
+      </div>}
+    </>;
+  }
+
+  if (selected && detailLoading) return <div style={{textAlign:'center',padding:40}}><span className="spinner"/> Cargando {selected}...</div>;
+
+  // Stack list view
+  return <>
+    <div style={{display:'flex',justifyContent:'space-between',marginBottom:12}}>
+      <span style={{fontSize:13,color:'var(--muted)'}}>{data.length} stacks</span>
+      <button className="btn btn-primary btn-sm" onClick={()=>setDeployModal(true)}>+ Deploy Stack</button>
+    </div>
+    <div className="grid-3">
+      {data.map((s,i) => <div key={i} className="card" style={{cursor:'pointer',transition:'all .15s',border:'1px solid var(--border)'}} onClick={()=>selectStack(s.Name)}
+        onMouseEnter={e=>{e.currentTarget.style.borderColor='var(--accent)';}} onMouseLeave={e=>{e.currentTarget.style.borderColor='var(--border)';}}>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8}}>
+          <h4 style={{fontSize:15,fontWeight:700}}>{s.Name}</h4>
+          <span className="badge badge-green">{s.Services} svcs</span>
+        </div>
+        <div style={{fontSize:12,color:'var(--muted)'}}>Click para ver detalle</div>
+      </div>)}
+    </div>
+
+    {deployModal && <Modal title="Deploy Stack" onClose={()=>setDeployModal(false)}>
+      <div style={{marginBottom:12}}>
+        <label style={{fontSize:12,color:'var(--muted)',marginBottom:4,display:'block'}}>Nombre del Stack</label>
+        <input value={deployName} onChange={e=>setDeployName(e.target.value)} placeholder="my-stack" />
+      </div>
+      <div style={{marginBottom:12}}>
+        <label style={{fontSize:12,color:'var(--muted)',marginBottom:4,display:'block'}}>Docker Compose YAML</label>
+        <textarea value={deployYaml} onChange={e=>setDeployYaml(e.target.value)} placeholder="version: '3.8'&#10;services:&#10;  web:&#10;    image: nginx" style={{fontFamily:'monospace',fontSize:12,minHeight:250,resize:'vertical'}} />
+      </div>
+      <button className="btn btn-primary" onClick={doDeploy} disabled={deploying||!deployName||!deployYaml}>
+        {deploying?<><span className="spinner" style={{width:14,height:14}}/> Desplegando...</>:'Deploy Stack'}
+      </button>
+    </Modal>}
+  </>;
 }
 
 // Containers
@@ -592,7 +775,7 @@ function App() {
       {tab==='dashboard' && <Dashboard overview={overview} nodeStats={nodeStats} loading={loading} />}
       {tab==='nodes' && <Nodes data={nodes} />}
       {tab==='services' && <Services data={services} onScale={scaleService} onRestart={doRestart} onLogs={id=>showLogs(id,'service')} onTasks={showTasks} />}
-      {tab==='stacks' && <Stacks data={stacks} onRemove={doStackRemove} />}
+      {tab==='stacks' && <Stacks data={stacks} onRemove={doStackRemove} toast={toast} />}
       {tab==='containers' && <Containers data={containers} onLogs={id=>showLogs(id,'container')} onAction={doContainerAction} />}
       {tab==='networks' && <Networks data={networks} />}
       {tab==='volumes' && <Volumes data={volumes} />}

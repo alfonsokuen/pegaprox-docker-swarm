@@ -609,6 +609,197 @@ def _api_stack_deploy():
     return {'error': 'Stack deploy failed'}, 500
 
 
+def _api_stack_detail():
+    """GET — Detailed info for a stack. ?name=xxx"""
+    name = request.args.get('name', '')
+    if not name or not all(c.isalnum() or c in '-_' for c in name):
+        return {'error': 'Valid stack name required'}, 400
+
+    # Get services for this stack
+    services = _docker_json(
+        f'docker service ls --filter label=com.docker.stack.namespace={name} --format "{{{{json .}}}}"'
+    ) or []
+
+    # Enrich each service with tasks
+    for svc in services:
+        svc_name = svc.get('Name', '')
+        tasks = _docker_json(
+            f'docker service ps {svc_name} --format "{{{{json .}}}}" --no-trunc 2>/dev/null'
+        ) or []
+        svc['tasks'] = tasks
+        # Get inspect for image, ports, etc.
+        inspect = _docker_json(f'docker service inspect {svc_name} --format "{{{{json .}}}}"')
+        if inspect and isinstance(inspect, list):
+            inspect = inspect[0]
+        if inspect:
+            spec = inspect.get('Spec', {})
+            task_tmpl = spec.get('TaskTemplate', {})
+            container_spec = task_tmpl.get('ContainerSpec', {})
+            endpoint = inspect.get('Endpoint', {})
+            mode = spec.get('Mode', {})
+            svc['image_full'] = container_spec.get('Image', '').split('@')[0]
+            svc['env_count'] = len(container_spec.get('Env', []))
+            svc['env_vars'] = container_spec.get('Env', [])
+            svc['mounts'] = container_spec.get('Mounts', [])
+            svc['ports_detail'] = endpoint.get('Ports', [])
+            svc['constraints'] = task_tmpl.get('Placement', {}).get('Constraints', [])
+            svc['resources_limits'] = task_tmpl.get('Resources', {}).get('Limits', {})
+            svc['resources_reservations'] = task_tmpl.get('Resources', {}).get('Reservations', {})
+            svc['created'] = inspect.get('CreatedAt', '')
+            svc['updated'] = inspect.get('UpdatedAt', '')
+            svc['labels'] = spec.get('Labels', {})
+            if 'Replicated' in mode:
+                svc['mode_type'] = 'replicated'
+                svc['replicas_spec'] = mode['Replicated'].get('Replicas', 0)
+            elif 'Global' in mode:
+                svc['mode_type'] = 'global'
+
+    # Get stack networks
+    networks = _docker_json(
+        f'docker network ls --filter label=com.docker.stack.namespace={name} --format "{{{{json .}}}}"'
+    ) or []
+
+    return {
+        'name': name,
+        'services': services,
+        'services_count': len(services),
+        'networks': networks,
+    }
+
+
+def _api_stack_compose():
+    """GET — Get the compose/config for a stack (reconstructed). ?name=xxx"""
+    name = request.args.get('name', '')
+    if not name or not all(c.isalnum() or c in '-_' for c in name):
+        return {'error': 'Valid stack name required'}, 400
+
+    # docker stack config is not available in older Docker versions
+    # Try docker stack config first, fallback to reconstructing from inspect
+    raw = _docker_cmd(f'docker stack config {name} 2>/dev/null')
+    if raw and not raw.startswith('Error') and 'unknown' not in raw.lower():
+        return {'compose': raw, 'source': 'stack-config'}
+
+    # Fallback: reconstruct from service inspects
+    services = _docker_json(
+        f'docker service ls --filter label=com.docker.stack.namespace={name} --format "{{{{json .}}}}"'
+    ) or []
+
+    compose = {'version': '3.8', 'services': {}}
+    for svc in services:
+        svc_name = svc.get('Name', '')
+        short_name = svc_name.replace(f'{name}_', '', 1)
+        inspect = _docker_json(f'docker service inspect {svc_name} --format "{{{{json .}}}}"')
+        if inspect and isinstance(inspect, list):
+            inspect = inspect[0]
+        if not inspect:
+            continue
+
+        spec = inspect.get('Spec', {})
+        task_tmpl = spec.get('TaskTemplate', {})
+        container_spec = task_tmpl.get('ContainerSpec', {})
+        resources = task_tmpl.get('Resources', {})
+        endpoint_spec = spec.get('EndpointSpec', {})
+        mode = spec.get('Mode', {})
+
+        svc_def = {}
+        img = container_spec.get('Image', '').split('@')[0]
+        if img:
+            svc_def['image'] = img
+
+        env = container_spec.get('Env', [])
+        if env:
+            svc_def['environment'] = env
+
+        mounts = container_spec.get('Mounts', [])
+        if mounts:
+            volumes = []
+            for m in mounts:
+                src = m.get('Source', '')
+                tgt = m.get('Target', '')
+                ro = ':ro' if m.get('ReadOnly') else ''
+                volumes.append(f'{src}:{tgt}{ro}' if src else tgt)
+            svc_def['volumes'] = volumes
+
+        ports = endpoint_spec.get('Ports', [])
+        if ports:
+            svc_def['ports'] = [
+                f"{p.get('PublishedPort', '')}:{p.get('TargetPort', '')}/{p.get('Protocol', 'tcp')}"
+                for p in ports if p.get('PublishedPort')
+            ]
+
+        constraints = task_tmpl.get('Placement', {}).get('Constraints', [])
+        if constraints:
+            svc_def.setdefault('deploy', {})['placement'] = {'constraints': constraints}
+
+        if 'Replicated' in mode:
+            replicas = mode['Replicated'].get('Replicas', 1)
+            if replicas != 1:
+                svc_def.setdefault('deploy', {})['replicas'] = replicas
+        elif 'Global' in mode:
+            svc_def.setdefault('deploy', {})['mode'] = 'global'
+
+        limits = resources.get('Limits', {})
+        reservations = resources.get('Reservations', {})
+        if limits or reservations:
+            res_def = {}
+            if limits:
+                res_def['limits'] = {}
+                if limits.get('NanoCPUs'):
+                    res_def['limits']['cpus'] = str(limits['NanoCPUs'] / 1e9)
+                if limits.get('MemoryBytes'):
+                    res_def['limits']['memory'] = f"{limits['MemoryBytes'] // 1024 // 1024}M"
+            if reservations:
+                res_def['reservations'] = {}
+                if reservations.get('NanoCPUs'):
+                    res_def['reservations']['cpus'] = str(reservations['NanoCPUs'] / 1e9)
+                if reservations.get('MemoryBytes'):
+                    res_def['reservations']['memory'] = f"{reservations['MemoryBytes'] // 1024 // 1024}M"
+            svc_def.setdefault('deploy', {})['resources'] = res_def
+
+        # User labels (exclude docker internal ones)
+        user_labels = {k: v for k, v in spec.get('Labels', {}).items()
+                       if not k.startswith('com.docker.')}
+        if user_labels:
+            svc_def['labels'] = user_labels
+
+        compose['services'][short_name] = svc_def
+
+    import yaml
+    try:
+        compose_yaml = yaml.dump(compose, default_flow_style=False, sort_keys=False)
+    except ImportError:
+        compose_yaml = json.dumps(compose, indent=2)
+
+    return {'compose': compose_yaml, 'source': 'reconstructed'}
+
+
+def _api_stack_logs():
+    """GET — Aggregated logs from all services in a stack. ?name=xxx&tail=50"""
+    name = request.args.get('name', '')
+    tail = request.args.get('tail', '50')
+    if not name or not all(c.isalnum() or c in '-_' for c in name):
+        return {'error': 'Valid stack name required'}, 400
+
+    try:
+        tail = min(int(tail), 500)
+    except ValueError:
+        tail = 50
+
+    # Get services in this stack
+    services = _docker_json(
+        f'docker service ls --filter label=com.docker.stack.namespace={name} --format "{{{{json .}}}}"'
+    ) or []
+
+    all_logs = []
+    for svc in services:
+        svc_name = svc.get('Name', '')
+        logs = _docker_cmd(f'docker service logs --tail {tail} --no-trunc {svc_name} 2>&1')
+        if logs:
+            all_logs.append(f'=== {svc_name} ===\n{logs}')
+
+    return {'logs': '\n\n'.join(all_logs), 'stack': name, 'services': len(services)}
+
+
 def _api_stack_remove():
     """POST — Remove a stack. Body: {stack_name}"""
     err = _require_admin()
@@ -838,6 +1029,9 @@ def register(app):
         'service-remove': _api_service_remove,
         'container-logs': _api_container_logs,
         'container-action': _api_container_action,
+        'stack-detail': _api_stack_detail,
+        'stack-compose': _api_stack_compose,
+        'stack-logs': _api_stack_logs,
         'stack-deploy': _api_stack_deploy,
         'stack-remove': _api_stack_remove,
         'config': _api_get_config,
