@@ -61,16 +61,47 @@ def _save_config(cfg):
         json.dump(cfg, f, indent=4)
 
 
-def _ssh_exec(host, user, password, command, timeout=15):
-    """Execute command on remote host via SSH, return (stdout, stderr, exit_code)"""
+def _ssh_exec(host_cfg_or_host, user=None, password=None, command='', timeout=15):
+    """Execute command on remote host via SSH, return (stdout, stderr, exit_code).
+
+    Accepts either:
+      - A host config dict: {host, user, key_file?, password?}
+      - Legacy positional args: (host, user, password, command)
+    Prefers key_file auth when available, falls back to password.
+    """
     import paramiko
+
+    # Normalize: accept dict or legacy positional args
+    if isinstance(host_cfg_or_host, dict):
+        h = host_cfg_or_host
+        host = h['host']
+        user = h['user']
+        key_file = h.get('key_file', '')
+        password = h.get('password', '')
+    else:
+        host = host_cfg_or_host
+        key_file = ''
+
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
-        client.connect(host, port=22, username=user, password=password,
-                       timeout=timeout, banner_timeout=timeout,
-                       auth_timeout=timeout, allow_agent=False,
-                       look_for_keys=False)
+        connect_kwargs = dict(
+            hostname=host, port=22, username=user,
+            timeout=timeout, banner_timeout=timeout,
+            auth_timeout=timeout,
+        )
+        if key_file and os.path.isfile(key_file):
+            connect_kwargs['key_filename'] = key_file
+            connect_kwargs['look_for_keys'] = False
+            connect_kwargs['allow_agent'] = False
+        elif password:
+            connect_kwargs['password'] = password
+            connect_kwargs['look_for_keys'] = False
+            connect_kwargs['allow_agent'] = False
+        else:
+            return '', 'No key_file or password configured', -1
+
+        client.connect(**connect_kwargs)
         stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
         exit_code = stdout.channel.recv_exit_status()
         out = stdout.read().decode('utf-8', errors='replace')
@@ -91,9 +122,7 @@ def _docker_cmd(command, host_cfg=None):
         hosts = [host_cfg]
 
     for h in hosts:
-        out, err, code = _ssh_exec(
-            h['host'], h['user'], h['password'], command
-        )
+        out, err, code = _ssh_exec(h, command=command)
         if code == 0:
             return out.strip()
         log.warning(f"[{PLUGIN_ID}] Command failed on {h['host']}: {err.strip()}")
@@ -338,8 +367,7 @@ def _fetch_containers():
     for h in hosts:
         raw = None
         out, err, code = _ssh_exec(
-            h['host'], h['user'], h['password'],
-            'docker ps -a --format "{{json .}}" --no-trunc'
+            h, command='docker ps -a --format "{{json .}}" --no-trunc'
         )
         if code == 0 and out.strip():
             for line in out.strip().split('\n'):
@@ -373,8 +401,7 @@ def _fetch_networks():
 
     for h in hosts:
         out, err, code = _ssh_exec(
-            h['host'], h['user'], h['password'],
-            'docker network ls -q | xargs -I{} docker network inspect {} --format "{{json .}}" 2>/dev/null'
+            h, command='docker network ls -q | xargs -I{} docker network inspect {} --format "{{json .}}" 2>/dev/null'
         )
         if code == 0 and out.strip():
             for line in out.strip().split('\n'):
@@ -418,8 +445,7 @@ def _fetch_volumes():
 
     for h in hosts:
         out, err, code = _ssh_exec(
-            h['host'], h['user'], h['password'],
-            'docker volume ls -q | xargs -I{} docker volume inspect {} --format "{{json .}}" 2>/dev/null'
+            h, command='docker volume ls -q | xargs -I{} docker volume inspect {} --format "{{json .}}" 2>/dev/null'
         )
         if code == 0 and out.strip():
             for line in out.strip().split('\n'):
@@ -453,8 +479,7 @@ def _fetch_images():
 
     for h in hosts:
         out, err, code = _ssh_exec(
-            h['host'], h['user'], h['password'],
-            'docker image ls --format "{{json .}}" --no-trunc'
+            h, command='docker image ls --format "{{json .}}" --no-trunc'
         )
         if code == 0 and out.strip():
             for line in out.strip().split('\n'):
@@ -1287,12 +1312,14 @@ def _api_get_config():
     if err:
         return err
     cfg = _load_config()
-    # Mask passwords
+    # Mask passwords, expose key_file and auth_method
     safe_hosts = []
     for h in cfg.get('swarm_hosts', []):
         safe = dict(h)
         if safe.get('password'):
             safe['password'] = '***'
+        # Indicate which auth method is active
+        safe['auth_method'] = 'key' if safe.get('key_file') else 'password'
         safe_hosts.append(safe)
     return {
         'swarm_hosts': safe_hosts,
@@ -1319,6 +1346,7 @@ def _api_save_config():
                 'name': h.get('name', ''),
                 'host': h.get('host', ''),
                 'user': h.get('user', ''),
+                'key_file': h.get('key_file', ''),
                 'password': h.get('password', ''),
             }
             # If password is masked, keep the old one
@@ -1341,16 +1369,19 @@ def _api_save_config():
 
 
 def _api_test_connection():
-    """POST — Test SSH connection to a host. Body: {host, user, password}"""
+    """POST — Test SSH connection to a host. Body: {host, user, key_file?, password?}"""
     data = request.get_json() or {}
     host = data.get('host', '')
     user = data.get('user', '')
+    key_file = data.get('key_file', '')
     password = data.get('password', '')
 
-    if not host or not user or not password:
-        return {'error': 'host, user, password required'}, 400
+    if not host or not user:
+        return {'error': 'host and user required'}, 400
+    if not key_file and not password:
+        return {'error': 'key_file or password required'}, 400
 
-    host_cfg = {'host': host, 'user': user, 'password': password}
+    host_cfg = {'host': host, 'user': user, 'key_file': key_file, 'password': password}
     result = _docker_cmd('docker info --format "{{json .Swarm}}"', host_cfg=host_cfg)
     if result:
         try:
@@ -1391,8 +1422,7 @@ def _api_image_pull():
         cfg = _load_config()
         target = next((h for h in cfg.get('swarm_hosts', []) if h['host'] == host), None)
         if target:
-            out, err, code = _ssh_exec(target['host'], target['user'], target['password'],
-                                       f'docker pull {image} 2>&1', timeout=120)
+            out, err, code = _ssh_exec(target, command=f'docker pull {image} 2>&1', timeout=120)
             if code == 0:
                 log_audit(_get_username(), 'docker.image_pull', f'Pulled {image} on {host}')
                 return {'success': True, 'message': out}
@@ -1556,7 +1586,7 @@ def _api_node_stats():
             ' && echo "\\"uptime_seconds\\": $(cat /proc/uptime | cut -d" " -f1 | cut -d. -f1)"'
             ' && echo "}"'
         )
-        out, err, code = _ssh_exec(h['host'], h['user'], h['password'], cmd)
+        out, err, code = _ssh_exec(h, command=cmd)
         if code == 0:
             try:
                 data = json.loads(out)

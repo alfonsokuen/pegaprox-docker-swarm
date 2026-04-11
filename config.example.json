@@ -4,7 +4,13 @@
             "name": "Swarm-Manager-1",
             "host": "192.168.1.10",
             "user": "your-ssh-user",
-            "password": "your-ssh-password"
+            "key_file": "/opt/PegaProx/plugins/docker_swarm/.ssh/id_ed25519"
+        },
+        {
+            "name": "Swarm-Manager-2 (password fallback)",
+            "host": "192.168.1.11",
+            "user": "your-ssh-user",
+            "password": "only-if-no-key-file"
         }
     ],
     "poll_interval": 30

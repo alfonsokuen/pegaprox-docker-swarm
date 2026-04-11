@@ -123,23 +123,36 @@ if [ -f /tmp/_ds_config_backup.json ]; then
     echo "  Restored existing config.json"
 fi
 
-# ── Configure SSH credentials ──
+# ── Configure SSH connection (key-based auth) ──
 echo ""
-echo -e "${BLUE}[3/7] Configuring Swarm connection...${NC}"
+echo -e "${BLUE}[3/7] Configuring Swarm connection (SSH key auth)...${NC}"
+
+SSH_DIR="$PLUGIN_DIR/.ssh"
+SSH_KEY="$SSH_DIR/id_ed25519"
+
+# Generate SSH keypair if it doesn't exist
+if [ ! -f "$SSH_KEY" ]; then
+    mkdir -p "$SSH_DIR"
+    ssh-keygen -t ed25519 -f "$SSH_KEY" -N "" -C "pegaprox-docker-swarm" > /dev/null 2>&1
+    echo -e "  ${GREEN}SSH keypair generated${NC} at $SSH_KEY"
+else
+    echo -e "  ${YELLOW}SSH keypair already exists${NC} at $SSH_KEY"
+fi
+chmod 700 "$SSH_DIR"
+chmod 600 "$SSH_KEY"
+chmod 644 "$SSH_KEY.pub"
 
 if [ -f "$PLUGIN_DIR/config.json" ]; then
     echo -e "  ${YELLOW}config.json already exists — keeping current config${NC}"
     echo "  (Edit $PLUGIN_DIR/config.json or use the plugin Settings tab to change)"
 else
     echo ""
-    echo -e "  ${BOLD}Enter your Docker Swarm manager SSH credentials:${NC}"
+    echo -e "  ${BOLD}Enter your Docker Swarm manager SSH details:${NC}"
     echo "  (You can add more nodes later via the plugin Settings tab)"
     echo ""
 
     read -p "  Swarm manager hostname/IP: " SWARM_HOST
     read -p "  SSH username: " SWARM_USER
-    read -sp "  SSH password: " SWARM_PASS
-    echo ""
     read -p "  Friendly name [swarm-manager]: " SWARM_NAME
     SWARM_NAME=${SWARM_NAME:-swarm-manager}
 
@@ -150,19 +163,34 @@ else
             "name": "$SWARM_NAME",
             "host": "$SWARM_HOST",
             "user": "$SWARM_USER",
-            "password": "$SWARM_PASS"
+            "key_file": "$SSH_KEY"
         }
     ],
     "poll_interval": 30
 }
 CFGEOF
-    echo -e "  ${GREEN}config.json created${NC}"
+    echo -e "  ${GREEN}config.json created (key-based auth, no passwords stored)${NC}"
+
+    # Distribute public key to the Swarm host
+    echo ""
+    echo -e "  ${BOLD}Distributing SSH public key to $SWARM_HOST...${NC}"
+    echo -e "  ${YELLOW}You will be asked for the SSH password ONE TIME to copy the key.${NC}"
+    echo -e "  ${YELLOW}After this, no password will be stored anywhere.${NC}"
+    echo ""
+    if ssh-copy-id -i "$SSH_KEY.pub" -o StrictHostKeyChecking=accept-new "${SWARM_USER}@${SWARM_HOST}" 2>/dev/null; then
+        echo -e "  ${GREEN}Public key installed on $SWARM_HOST${NC}"
+    else
+        echo -e "  ${RED}Could not copy key automatically.${NC}"
+        echo -e "  ${YELLOW}Manually run on each Swarm node:${NC}"
+        echo -e "  ${CYAN}  cat $SSH_KEY.pub | ssh ${SWARM_USER}@${SWARM_HOST} 'mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys'${NC}"
+    fi
 fi
 
 # Set permissions
 chown -R pegaprox:pegaprox "$PLUGIN_DIR" 2>/dev/null || chown -R $(stat -c %U "$PEGAPROX_DIR") "$PLUGIN_DIR"
 chmod 600 "$PLUGIN_DIR/config.json"
-echo "  Permissions set (config.json: 600)"
+chmod 600 "$SSH_KEY" 2>/dev/null
+echo "  Permissions set (config.json: 600, private key: 600)"
 
 # ── Enable plugin in PegaProx ──
 echo ""
