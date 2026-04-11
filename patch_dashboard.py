@@ -51,9 +51,13 @@ topo_effect_new = """}, [sidebarTopology]);
 
             useEffect(() => {
                 if (!sidebarTopology) return;
-                fetch('/api/plugins/docker_swarm/api/topology', {credentials: 'include'})
-                    .then(r => r.json()).then(d => { if (d && d.nodes) setSwarmTopoData(d); })
-                    .catch(() => {});
+                fetch('/api/plugins/docker_swarm/api/topology', {
+                    credentials: 'include',
+                    headers: getAuthHeaders ? getAuthHeaders() : {}
+                })
+                    .then(r => { if (!r.ok) throw new Error(r.status); return r.json(); })
+                    .then(d => { if (d && d.nodes && d.nodes.length > 0) setSwarmTopoData(d); })
+                    .catch(e => console.warn('[DockerSwarm] Topology fetch:', e));
             }, [sidebarTopology]);
 
             // LW: Feb 2026 - corporate sidebar inventory tree state"""
