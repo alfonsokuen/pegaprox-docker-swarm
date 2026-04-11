@@ -143,7 +143,7 @@ function Modal({ title, onClose, children }) {
 // ============== PAGES ==============
 
 // Dashboard — enhanced visual design
-function Dashboard({ overview, nodeStats, onRefresh, loading }) {
+function Dashboard({ overview, nodeStats, loadBalance, onRefresh, loading }) {
   if (!overview || overview.error) return <div className="card" style={{textAlign:'center',padding:60}}>
     <div style={{fontSize:40,marginBottom:12,opacity:.3}}>~</div>
     <p style={{color:'var(--muted)',marginBottom:8,fontSize:15}}>No hay conexion al Swarm</p>
@@ -256,6 +256,45 @@ function Dashboard({ overview, nodeStats, onRefresh, loading }) {
         })}
       </div>
     </div>}
+
+    {/* Task Balance Summary */}
+    {loadBalance && !loadBalance.error && (() => {
+      const { nodes, total_tasks, balance_score, recommendation } = loadBalance;
+      const scoreColor = balance_score >= 80 ? 'var(--green)' : balance_score >= 50 ? 'var(--yellow)' : 'var(--red)';
+      const colors = ['#3b82f6','#10b981','#f59e0b','#ef4444','#8b5cf6'];
+      return <div className="card" style={{marginBottom:16}}>
+        <div style={{display:'flex',alignItems:'center',gap:16,marginBottom:12}}>
+          <h4 style={{fontSize:13,color:'var(--muted)',margin:0}}>Task Balance</h4>
+          <div style={{display:'flex',alignItems:'center',gap:6}}>
+            <span style={{fontSize:20,fontWeight:800,color:scoreColor}}>{balance_score}</span>
+            <span style={{fontSize:11,color:'var(--muted)'}}>/100</span>
+          </div>
+          <span style={{fontSize:11,color:'var(--muted)',marginLeft:'auto'}}>{total_tasks} tasks</span>
+        </div>
+        {/* Stacked bar */}
+        <div style={{display:'flex',height:20,borderRadius:4,overflow:'hidden',marginBottom:8}}>
+          {nodes.map((n,i) => {
+            const pct = total_tasks > 0 ? (n.tasks_running / total_tasks) * 100 : 0;
+            return <div key={i} title={`${n.name}: ${n.tasks_running} tasks`}
+              style={{width:`${pct}%`,background:colors[i%colors.length],minWidth:pct>0?2:0,transition:'width .3s'}} />;
+          })}
+        </div>
+        <div style={{display:'flex',gap:16,flexWrap:'wrap'}}>
+          {nodes.map((n,i) => {
+            const pct = total_tasks > 0 ? ((n.tasks_running / total_tasks) * 100).toFixed(0) : 0;
+            return <div key={i} style={{display:'flex',alignItems:'center',gap:6,fontSize:12}}>
+              <span style={{width:8,height:8,borderRadius:2,background:colors[i%colors.length],display:'inline-block'}} />
+              <span style={{color:'var(--muted)'}}>{n.name}</span>
+              <span style={{fontWeight:600}}>{n.tasks_running}</span>
+              <span style={{color:'var(--muted)',fontSize:11}}>({pct}%)</span>
+            </div>;
+          })}
+        </div>
+        {recommendation && <div style={{marginTop:8,padding:'6px 10px',background:'rgba(245,158,11,.1)',border:'1px solid rgba(245,158,11,.2)',borderRadius:4,fontSize:11,color:'var(--yellow)'}}>
+          {recommendation}
+        </div>}
+      </div>;
+    })()}
 
     {/* Node Resources — enhanced cards instead of plain table */}
     {nodeStats && nodeStats.stats && <div>
@@ -1484,8 +1523,8 @@ function App() {
     try {
       switch(t) {
         case 'dashboard':
-          const [ov, ns] = await Promise.all([api('overview'), api('node-stats')]);
-          setOverview(ov); setNodeStats(ns); break;
+          const [ov, ns, lb] = await Promise.all([api('overview'), api('node-stats'), api('load-balance')]);
+          setOverview(ov); setNodeStats(ns); setLoadBalance(lb); break;
         case 'nodes': setNodes(await api('nodes')); break;
         case 'services': setServices(await api('services')); break;
         case 'stacks': setStacks(await api('stacks')); break;
@@ -1604,7 +1643,7 @@ function App() {
         {tab==='dashboard' && <div className="countdown-bar" style={{width:`${(countdown/REFRESH_INTERVAL)*100}%`}}/>}
       </div>
 
-      {tab==='dashboard' && <Dashboard overview={overview} nodeStats={nodeStats} loading={loading} />}
+      {tab==='dashboard' && <Dashboard overview={overview} nodeStats={nodeStats} loadBalance={loadBalance} loading={loading} />}
       {tab==='nodes' && <Nodes data={nodes} />}
       {tab==='services' && <Services data={services} onScale={scaleService} onRestart={doRestart} onLogs={id=>showLogs(id,'service')} onTasks={showTasks} toast={toast} />}
       {tab==='stacks' && <Stacks data={stacks} onRemove={doStackRemove} toast={toast} />}
