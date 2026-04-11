@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.0.0-blue" alt="Version"/>
+  <img src="https://img.shields.io/badge/version-1.6.0-blue" alt="Version"/>
   <img src="https://img.shields.io/badge/pegaprox-0.9.0+-orange" alt="PegaProx"/>
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License"/>
   <img src="https://img.shields.io/badge/python-3.8+-yellow" alt="Python"/>
@@ -22,6 +22,28 @@
 A PegaProx plugin that brings Docker Swarm cluster management into PegaProx's interface. Connect to your Swarm manager nodes via SSH and get full visibility and control over your Docker infrastructure — without leaving PegaProx.
 
 Born from [Feature Request #152](https://github.com/PegaProx/project-pegaprox/issues/152) on the PegaProx project.
+
+## Screenshots
+
+### Dashboard
+<p align="center">
+  <img src="screenshots/dashboard.png" alt="Dashboard" width="800"/>
+</p>
+
+### Stacks
+<p align="center">
+  <img src="screenshots/stacks.png" alt="Stacks" width="800"/>
+</p>
+
+### Stack Detail
+<p align="center">
+  <img src="screenshots/stack-detail.png" alt="Stack Detail" width="800"/>
+</p>
+
+### Services
+<p align="center">
+  <img src="screenshots/services.png" alt="Services" width="800"/>
+</p>
 
 ## Features
 
