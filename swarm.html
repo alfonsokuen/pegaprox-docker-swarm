@@ -356,6 +356,8 @@ function Stacks({ data, onRemove, toast }) {
         <div className={`tab ${activeView==='logs'?'active':''}`} onClick={()=>{setActiveView('logs');loadLogs();}}>Logs</div>
         <div className={`tab ${activeView==='env'?'active':''}`} onClick={()=>setActiveView('env')}>Variables</div>
         <div style={{marginLeft:'auto',display:'flex',gap:6}}>
+          {healthy ? <button className="btn btn-sm" style={{background:'var(--red)',borderColor:'var(--red)',color:'#fff'}} onClick={async()=>{if(!confirm(`Detener stack ${selected}? Todos los servicios se escalaran a 0.`))return;const r=await api('stack-stop',{method:'POST',body:{stack_name:selected}});if(r.success){toast(r.message,'success');selectStack(selected);}else toast(r.error,'error');}}>Stop Stack</button>
+          : <button className="btn btn-sm" style={{background:'var(--green)',borderColor:'var(--green)',color:'#fff'}} onClick={async()=>{const r=await api('stack-start',{method:'POST',body:{stack_name:selected}});if(r.success){toast(r.message,'success');selectStack(selected);}else toast(r.error,'error');}}>Start Stack</button>}
           {compose && <button className="btn btn-sm btn-primary" onClick={()=>doRedeploy(selected)}>Redeploy</button>}
           <button className="btn btn-sm btn-danger" onClick={()=>{onRemove(selected);setSelected(null);}}>Remove Stack</button>
         </div>
@@ -447,14 +449,25 @@ function Stacks({ data, onRemove, toast }) {
       <button className="btn btn-primary btn-sm" onClick={()=>setDeployModal(true)}>+ Deploy Stack</button>
     </div>
     <div className="grid-3">
-      {data.map((s,i) => <div key={i} className="card" style={{cursor:'pointer',transition:'all .15s',border:'1px solid var(--border)'}} onClick={()=>selectStack(s.Name)}
-        onMouseEnter={e=>{e.currentTarget.style.borderColor='var(--accent)';}} onMouseLeave={e=>{e.currentTarget.style.borderColor='var(--border)';}}>
-        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8}}>
-          <h4 style={{fontSize:15,fontWeight:700}}>{s.Name}</h4>
-          <span className="badge badge-green">{s.Services} svcs</span>
-        </div>
-        <div style={{fontSize:12,color:'var(--muted)'}}>Click para ver detalle</div>
-      </div>)}
+      {data.map((s,i) => {
+        const svcCount = typeof s.Services === 'number' ? s.Services : parseInt(s.Services) || 0;
+        return <div key={i} className="card fade-in" style={{cursor:'pointer',transition:'all .2s',border:'1px solid var(--border)'}} onClick={()=>selectStack(s.Name)}
+          onMouseEnter={e=>{e.currentTarget.style.borderColor='var(--accent)';e.currentTarget.style.transform='translateY(-2px)';}} onMouseLeave={e=>{e.currentTarget.style.borderColor='var(--border)';e.currentTarget.style.transform='none';}}>
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8}}>
+            <div style={{display:'flex',alignItems:'center',gap:8}}>
+              <span className="live-dot" style={{width:6,height:6}}/>
+              <h4 style={{fontSize:15,fontWeight:700}}>{s.Name}</h4>
+            </div>
+            <span className="badge badge-green">{svcCount} svcs</span>
+          </div>
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+            <span style={{fontSize:12,color:'var(--muted)'}}>Click para ver detalle</span>
+            <div style={{display:'flex',gap:4}}>
+              <button className="btn btn-sm" style={{fontSize:11,padding:'2px 6px'}} onClick={e=>{e.stopPropagation();api('stack-stop',{method:'POST',body:{stack_name:s.Name}}).then(r=>{if(r.success)toast('Detenido','success');});}}>Stop</button>
+            </div>
+          </div>
+        </div>;
+      })}
     </div>
 
     {deployModal && <Modal title="Deploy Stack" onClose={()=>setDeployModal(false)}>

@@ -800,6 +800,88 @@ def _api_stack_logs():
     return {'logs': '\n\n'.join(all_logs), 'stack': name, 'services': len(services)}
 
 
+def _api_stack_stop():
+    """POST — Stop a stack by scaling all replicated services to 0. Body: {stack_name}
+    Saves current replica counts so they can be restored with stack-start."""
+    data = request.get_json() or {}
+    stack_name = data.get('stack_name', '')
+    if not stack_name or not all(c.isalnum() or c in '-_' for c in stack_name):
+        return {'error': 'Valid stack_name required'}, 400
+
+    services = _docker_json(
+        f'docker service ls --filter label=com.docker.stack.namespace={stack_name} --format "{{{{json .}}}}"'
+    ) or []
+
+    saved_replicas = {}
+    scaled = 0
+    for svc in services:
+        svc_name = svc.get('Name', '')
+        replicas_str = svc.get('Replicas', '0/0')
+        # Parse "3/3" → desired=3
+        parts = replicas_str.split('/')
+        desired = int(parts[-1]) if parts[-1].isdigit() else 0
+        saved_replicas[svc_name] = desired
+
+        if desired > 0:
+            result = _docker_cmd(f'docker service scale {svc_name}=0')
+            if result is not None:
+                scaled += 1
+
+    # Save replica counts to a temp file on remote for later restore
+    import base64
+    replica_json = json.dumps(saved_replicas)
+    b64 = base64.b64encode(replica_json.encode()).decode()
+    _docker_cmd(f'echo "{b64}" | base64 -d > /tmp/_pegaprox_stack_replicas_{stack_name}.json')
+
+    log_audit(_get_username(), 'docker.stack_stopped', f'Stopped stack {stack_name} ({scaled} services scaled to 0)')
+    with _cache_lock:
+        _cache.pop('services', None)
+        _cache.pop('stacks', None)
+        _cache.pop('overview', None)
+
+    return {'success': True, 'message': f'Stack {stack_name} stopped ({scaled} services scaled to 0)', 'saved_replicas': saved_replicas}
+
+
+def _api_stack_start():
+    """POST — Start a stack by restoring saved replica counts. Body: {stack_name}"""
+    data = request.get_json() or {}
+    stack_name = data.get('stack_name', '')
+    if not stack_name or not all(c.isalnum() or c in '-_' for c in stack_name):
+        return {'error': 'Valid stack_name required'}, 400
+
+    # Try to read saved replicas
+    raw = _docker_cmd(f'cat /tmp/_pegaprox_stack_replicas_{stack_name}.json 2>/dev/null')
+    saved_replicas = {}
+    if raw:
+        try:
+            saved_replicas = json.loads(raw)
+        except json.JSONDecodeError:
+            pass
+
+    # If no saved state, default all replicated services to 1
+    if not saved_replicas:
+        services = _docker_json(
+            f'docker service ls --filter label=com.docker.stack.namespace={stack_name} --format "{{{{json .}}}}"'
+        ) or []
+        for svc in services:
+            saved_replicas[svc.get('Name', '')] = 1
+
+    started = 0
+    for svc_name, replicas in saved_replicas.items():
+        if replicas > 0:
+            result = _docker_cmd(f'docker service scale {svc_name}={replicas}')
+            if result is not None:
+                started += 1
+
+    log_audit(_get_username(), 'docker.stack_started', f'Started stack {stack_name} ({started} services restored)')
+    with _cache_lock:
+        _cache.pop('services', None)
+        _cache.pop('stacks', None)
+        _cache.pop('overview', None)
+
+    return {'success': True, 'message': f'Stack {stack_name} started ({started} services restored)', 'replicas': saved_replicas}
+
+
 def _api_stack_remove():
     """POST — Remove a stack. Body: {stack_name}"""
     err = _require_admin()
@@ -1032,6 +1114,8 @@ def register(app):
         'stack-detail': _api_stack_detail,
         'stack-compose': _api_stack_compose,
         'stack-logs': _api_stack_logs,
+        'stack-stop': _api_stack_stop,
+        'stack-start': _api_stack_start,
         'stack-deploy': _api_stack_deploy,
         'stack-remove': _api_stack_remove,
         'config': _api_get_config,
