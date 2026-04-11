@@ -770,90 +770,378 @@ function Stacks({ data, onRemove, toast }) {
   </>;
 }
 
-// Containers
-function Containers({ data, onLogs, onAction }) {
+// Containers — Portainer-style with multi-select, bulk actions, pagination, state filter
+function Containers({ data, onLogs, onAction, toast }) {
   const [filter, setFilter] = useState('');
+  const [stateFilter, setStateFilter] = useState('all');
+  const [selected, setSelected] = useState(new Set());
+  const [page, setPage] = useState(1);
+  const [perPage, setPerPage] = useState(10);
+  const [sortCol, setSortCol] = useState('Names');
+  const [sortAsc, setSortAsc] = useState(true);
+
   const containers = data?.containers || [];
+
   const filtered = containers.filter(c => {
     const f = filter.toLowerCase();
-    return !f || (c.Names||'').toLowerCase().includes(f) || (c.Image||'').toLowerCase().includes(f);
+    const state = (c.State||'').toLowerCase();
+    const matchFilter = !f || (c.Names||'').toLowerCase().includes(f) || (c.Image||'').toLowerCase().includes(f) || (c._node||'').toLowerCase().includes(f);
+    const matchState = stateFilter==='all' || state===stateFilter;
+    return matchFilter && matchState;
+  }).sort((a,b) => {
+    const va = (a[sortCol]||'').toString().toLowerCase();
+    const vb = (b[sortCol]||'').toString().toLowerCase();
+    return sortAsc ? va.localeCompare(vb) : vb.localeCompare(va);
   });
 
+  const totalPages = Math.ceil(filtered.length / perPage);
+  const paged = filtered.slice((page-1)*perPage, page*perPage);
+
+  const toggleSelect = (id) => { const s=new Set(selected); s.has(id)?s.delete(id):s.add(id); setSelected(s); };
+  const selectAll = () => { if(selected.size===paged.length){setSelected(new Set());}else{setSelected(new Set(paged.map(c=>c.ID||c.Names)));} };
+
+  const bulkAction = async (action) => {
+    if(selected.size===0)return;
+    if(!confirm(`${action} ${selected.size} contenedores?`))return;
+    let ok=0;
+    for(const id of selected){
+      const c = containers.find(x=>(x.ID||x.Names)===id);
+      const r=await api('container-action',{method:'POST',body:{container_id:id,action,host:c?._host||''}});
+      if(r.success)ok++;
+    }
+    toast(`${action}: ${ok}/${selected.size} exitosos`,'success');
+    setSelected(new Set());
+    onAction(null,null,true); // signal reload
+  };
+
+  const SortHeader = ({col, children}) => <th style={{cursor:'pointer',userSelect:'none'}} onClick={()=>{if(sortCol===col)setSortAsc(!sortAsc);else{setSortCol(col);setSortAsc(true);}}}>
+    {children} {sortCol===col ? (sortAsc?'↑':'↓') : ''}
+  </th>;
+
+  const stateColor = (s) => {
+    s = (s||'').toLowerCase();
+    if(s==='running') return {bg:'rgba(34,197,94,.15)',color:'var(--green)',text:'running'};
+    if(s==='exited') return {bg:'rgba(239,68,68,.15)',color:'var(--red)',text:'exited'};
+    if(s==='paused') return {bg:'rgba(234,179,8,.15)',color:'var(--yellow)',text:'paused'};
+    if(s==='created') return {bg:'rgba(59,130,246,.15)',color:'var(--blue)',text:'created'};
+    return {bg:'rgba(113,113,122,.15)',color:'var(--muted)',text:s||'unknown'};
+  };
+
+  // Get stack name from container labels (docker appends it)
+  const getStack = (c) => {
+    const labels = c.Labels || '';
+    const m = labels.match(/com\.docker\.stack\.namespace=([^,]+)/);
+    return m ? m[1] : '-';
+  };
+
+  const runningCount = containers.filter(c=>(c.State||'').toLowerCase()==='running').length;
+  const stoppedCount = containers.filter(c=>(c.State||'').toLowerCase()!=='running').length;
+
   return <>
-    <div style={{marginBottom:12}}>
-      <input placeholder="Filtrar contenedores..." value={filter} onChange={e=>setFilter(e.target.value)} style={{maxWidth:300}} />
+    {/* Top bar with actions */}
+    <div className="card" style={{display:'flex',alignItems:'center',gap:8,padding:'8px 12px',marginBottom:12,flexWrap:'wrap'}}>
+      <span style={{fontSize:13,fontWeight:600,marginRight:4}}>Containers</span>
+      <input placeholder="Search..." value={filter} onChange={e=>{setFilter(e.target.value);setPage(1);}} style={{maxWidth:200,padding:'4px 8px'}} />
+      <div style={{display:'flex',gap:4,borderLeft:'1px solid var(--border)',paddingLeft:8,marginLeft:4}}>
+        <button className="btn btn-sm" disabled={selected.size===0} onClick={()=>bulkAction('start')}>Start</button>
+        <button className="btn btn-sm" disabled={selected.size===0} onClick={()=>bulkAction('stop')}>Stop</button>
+        <button className="btn btn-sm" disabled={selected.size===0} onClick={()=>bulkAction('kill')}>Kill</button>
+        <button className="btn btn-sm" disabled={selected.size===0} onClick={()=>bulkAction('restart')}>Restart</button>
+        <button className="btn btn-sm" disabled={selected.size===0} onClick={()=>bulkAction('pause')}>Pause</button>
+        <button className="btn btn-sm" disabled={selected.size===0} onClick={()=>bulkAction('unpause')}>Resume</button>
+        <button className="btn btn-sm btn-danger" disabled={selected.size===0} onClick={()=>bulkAction('remove')}>Remove</button>
+      </div>
+      <div style={{marginLeft:'auto',display:'flex',gap:8,alignItems:'center'}}>
+        <span style={{fontSize:11,color:'var(--muted)'}}>{runningCount} running / {stoppedCount} stopped</span>
+      </div>
     </div>
-    <div className="card" style={{overflowX:'auto'}}>
+
+    {/* State filter tabs */}
+    <div style={{display:'flex',gap:4,marginBottom:12}}>
+      {[{id:'all',label:`All (${containers.length})`},{id:'running',label:`Running (${runningCount})`},{id:'exited',label:`Stopped (${containers.filter(c=>(c.State||'')==='exited').length})`},{id:'paused',label:'Paused'}].map(f=>
+        <button key={f.id} className={`btn btn-sm ${stateFilter===f.id?'btn-primary':''}`} onClick={()=>{setStateFilter(f.id);setPage(1);}}>{f.label}</button>
+      )}
+    </div>
+
+    {/* Table */}
+    <div className="card" style={{overflowX:'auto',padding:0}}>
       <table>
-        <thead><tr><th>Nombre</th><th>Image</th><th>Status</th><th>Ports</th><th>Created</th><th>Acciones</th></tr></thead>
-        <tbody>{filtered.map((c,i) => <tr key={i}>
-          <td><strong>{c.Names}</strong><div style={{fontSize:11,color:'var(--muted)',fontFamily:'monospace'}}>{(c.ID||'').substring(0,12)}</div></td>
-          <td style={{fontSize:12,maxWidth:180,overflow:'hidden',textOverflow:'ellipsis'}}>{c.Image}</td>
-          <td><StatusBadge status={c.State || c.Status?.split(' ')[0]} /><div style={{fontSize:11,color:'var(--muted)'}}>{c.Status}</div></td>
-          <td style={{fontSize:11,fontFamily:'monospace'}}>{c.Ports || '-'}</td>
-          <td style={{fontSize:12,color:'var(--muted)'}}>{c.RunningFor || c.CreatedAt}</td>
-          <td style={{whiteSpace:'nowrap'}}>
-            <button className="btn btn-sm" onClick={()=>onLogs(c.ID||c.Names)}>Logs</button>{' '}
-            <button className="btn btn-sm" onClick={()=>onAction(c.ID||c.Names,'restart')}>Restart</button>{' '}
-            {(c.State||'').toLowerCase()==='running'
-              ? <button className="btn btn-sm" onClick={()=>onAction(c.ID||c.Names,'stop')}>Stop</button>
-              : <button className="btn btn-sm" onClick={()=>onAction(c.ID||c.Names,'start')}>Start</button>
-            }
-          </td>
-        </tr>)}</tbody>
+        <thead><tr>
+          <th style={{width:30}}><input type="checkbox" checked={selected.size===paged.length&&paged.length>0} onChange={selectAll}/></th>
+          <SortHeader col="Names">Name</SortHeader>
+          <SortHeader col="State">State</SortHeader>
+          <th>Quick Actions</th>
+          <th>Stack</th>
+          <SortHeader col="Image">Image</SortHeader>
+          <SortHeader col="CreatedAt">Created</SortHeader>
+          <th>IP Address</th>
+          <th>Node</th>
+        </tr></thead>
+        <tbody>{paged.map((c,i) => {
+          const id = c.ID || c.Names;
+          const sc = stateColor(c.State);
+          const status = c.Status || '';
+          const stack = getStack(c);
+          // Extract IP from Networks field if available
+          const networks = c.Networks || '';
+          return <tr key={i} style={{background:selected.has(id)?'rgba(229,112,0,.05)':''}}>
+            <td><input type="checkbox" checked={selected.has(id)} onChange={()=>toggleSelect(id)}/></td>
+            <td>
+              <strong style={{fontSize:13}}>{c.Names}</strong>
+              <div style={{fontSize:11,color:'var(--muted)',fontFamily:'monospace'}}>{(c.ID||'').substring(0,12)}</div>
+            </td>
+            <td>
+              <span style={{display:'inline-flex',alignItems:'center',padding:'2px 8px',borderRadius:9999,fontSize:11,fontWeight:600,background:sc.bg,color:sc.color}}>
+                {status || sc.text}
+              </span>
+            </td>
+            <td style={{whiteSpace:'nowrap'}}>
+              <button className="btn btn-sm" title="Logs" onClick={()=>onLogs(c.ID,c._host)} style={{padding:'2px 5px'}}>L</button>{' '}
+              <button className="btn btn-sm" title="Restart" onClick={()=>onAction(id,'restart',false,c._host)} style={{padding:'2px 5px'}}>R</button>{' '}
+              {(c.State||'')==='running'
+                ? <button className="btn btn-sm" title="Stop" onClick={()=>onAction(id,'stop',false,c._host)} style={{padding:'2px 5px'}}>S</button>
+                : <button className="btn btn-sm" title="Start" onClick={()=>onAction(id,'start',false,c._host)} style={{padding:'2px 5px'}}>P</button>
+              }
+            </td>
+            <td>{stack!=='-' ? <span className="badge badge-blue">{stack}</span> : '-'}</td>
+            <td style={{fontSize:12,maxWidth:250,overflow:'hidden',textOverflow:'ellipsis'}} title={c.Image}>{c.Image}</td>
+            <td style={{fontSize:12,color:'var(--muted)',whiteSpace:'nowrap'}}>{c.CreatedAt || c.RunningFor}</td>
+            <td style={{fontFamily:'monospace',fontSize:12}}>{networks || '-'}</td>
+            <td><span className="badge badge-muted">{c._node||'-'}</span></td>
+          </tr>;
+        })}</tbody>
       </table>
     </div>
-    <div style={{marginTop:8,fontSize:12,color:'var(--muted)'}}>{filtered.length} de {containers.length} contenedores</div>
+
+    {/* Pagination */}
+    <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginTop:12}}>
+      <div style={{fontSize:12,color:'var(--muted)'}}>{filtered.length} contenedores</div>
+      <div style={{display:'flex',alignItems:'center',gap:8}}>
+        <span style={{fontSize:12,color:'var(--muted)'}}>Items per page</span>
+        <select value={perPage} onChange={e=>{setPerPage(parseInt(e.target.value));setPage(1);}} style={{width:60,padding:'2px 4px'}}>
+          <option value={10}>10</option><option value={25}>25</option><option value={50}>50</option><option value={100}>100</option>
+        </select>
+        <div style={{display:'flex',gap:2}}>
+          <button className="btn btn-sm" disabled={page<=1} onClick={()=>setPage(page-1)}>‹</button>
+          {Array.from({length:Math.min(totalPages,5)},(_,i)=>{
+            let p;
+            if(totalPages<=5)p=i+1;
+            else if(page<=3)p=i+1;
+            else if(page>=totalPages-2)p=totalPages-4+i;
+            else p=page-2+i;
+            return <button key={p} className={`btn btn-sm ${page===p?'btn-primary':''}`} onClick={()=>setPage(p)}>{p}</button>;
+          })}
+          {totalPages>5 && page<totalPages-2 && <span style={{color:'var(--muted)'}}>...</span>}
+          {totalPages>5 && page<totalPages-2 && <button className="btn btn-sm" onClick={()=>setPage(totalPages)}>{totalPages}</button>}
+          <button className="btn btn-sm" disabled={page>=totalPages} onClick={()=>setPage(page+1)}>›</button>
+        </div>
+      </div>
+    </div>
   </>;
 }
 
-// Networks
-function Networks({ data }) {
+// Networks — Portainer style with IPAM details, Stack, multi-node
+function Networks({ data, toast }) {
+  const [filter, setFilter] = useState('');
+  const [selected, setSelected] = useState(new Set());
   const nets = data?.networks || [];
-  return <div className="card">
-    <table>
-      <thead><tr><th>Nombre</th><th>ID</th><th>Driver</th><th>Scope</th></tr></thead>
-      <tbody>{nets.map((n,i) => <tr key={i}>
-        <td><strong>{n.Name}</strong></td>
-        <td style={{fontFamily:'monospace',fontSize:12}}>{(n.ID||'').substring(0,12)}</td>
-        <td><span className="badge badge-blue">{n.Driver}</span></td>
-        <td>{n.Scope}</td>
-      </tr>)}</tbody>
-    </table>
-  </div>;
+  const filtered = nets.filter(n => !filter || (n.Name||'').toLowerCase().includes(filter.toLowerCase()));
+  const toggle = id => { const s=new Set(selected); s.has(id)?s.delete(id):s.add(id); setSelected(s); };
+  const removeSelected = async () => {
+    if(!confirm(`Eliminar ${selected.size} redes?`))return;
+    let ok=0;
+    for(const name of selected){ const r=await api('network-remove',{method:'POST',body:{network_name:name}}); if(r.success)ok++; }
+    toast(`${ok} redes eliminadas`,'success'); setSelected(new Set());
+  };
+
+  return <>
+    <div className="card" style={{display:'flex',alignItems:'center',gap:8,padding:'8px 12px',marginBottom:12}}>
+      <span style={{fontSize:13,fontWeight:600}}>Networks</span>
+      <input placeholder="Search..." value={filter} onChange={e=>setFilter(e.target.value)} style={{maxWidth:200,padding:'4px 8px'}} />
+      <button className="btn btn-sm btn-danger" disabled={selected.size===0} onClick={removeSelected}>Remove</button>
+    </div>
+    <div className="card" style={{overflowX:'auto',padding:0}}>
+      <table>
+        <thead><tr><th style={{width:30}}><input type="checkbox" onChange={()=>{if(selected.size===filtered.length)setSelected(new Set());else setSelected(new Set(filtered.map(n=>n.Name)));}} checked={selected.size===filtered.length&&filtered.length>0}/></th><th>Name</th><th>Stack</th><th>Driver</th><th>Attachable</th><th>IPAM Driver</th><th>IPV4 IPAM Subnet</th><th>IPV4 IPAM Gateway</th><th>Scope</th></tr></thead>
+        <tbody>{filtered.map((n,i) => <tr key={i}>
+          <td><input type="checkbox" checked={selected.has(n.Name)} onChange={()=>toggle(n.Name)}/></td>
+          <td><strong style={{color:'var(--blue)'}}>{n.Name}</strong>{n.System && <span className="badge badge-blue" style={{marginLeft:6}}>System</span>}</td>
+          <td>{n.Stack ? <span className="badge badge-blue">{n.Stack}</span> : '-'}</td>
+          <td>{n.Driver}</td>
+          <td>{n.Attachable ? 'true' : 'false'}</td>
+          <td>{n.IPAM_Driver||'default'}</td>
+          <td style={{fontFamily:'monospace',fontSize:12}}>{n.Subnet||'-'}</td>
+          <td style={{fontFamily:'monospace',fontSize:12}}>{n.Gateway||'-'}</td>
+          <td>{n.Scope}</td>
+        </tr>)}</tbody>
+      </table>
+    </div>
+    <div style={{marginTop:8,fontSize:12,color:'var(--muted)'}}>{filtered.length} redes</div>
+  </>;
 }
 
-// Volumes
-function Volumes({ data }) {
+// Volumes — Portainer style with Stack, Mountpoint, Browse, multi-node
+function Volumes({ data, toast }) {
+  const [filter, setFilter] = useState('');
+  const [selected, setSelected] = useState(new Set());
+  const [page, setPage] = useState(1);
+  const perPage = 10;
   const vols = data?.volumes || [];
-  return <div className="card">
-    <table>
-      <thead><tr><th>Nombre</th><th>Driver</th><th>Scope</th><th>Mountpoint</th></tr></thead>
-      <tbody>{vols.map((v,i) => <tr key={i}>
-        <td><strong>{v.Name}</strong></td>
-        <td>{v.Driver}</td>
-        <td>{v.Scope || '-'}</td>
-        <td style={{fontSize:12,fontFamily:'monospace',maxWidth:300,overflow:'hidden',textOverflow:'ellipsis'}}>{v.Mountpoint}</td>
-      </tr>)}</tbody>
-    </table>
-  </div>;
+  const filtered = vols.filter(v => !filter || (v.Name||'').toLowerCase().includes(filter.toLowerCase()) || (v.Stack||'').toLowerCase().includes(filter.toLowerCase()));
+  const totalPages = Math.ceil(filtered.length / perPage);
+  const paged = filtered.slice((page-1)*perPage, page*perPage);
+  const toggle = id => { const s=new Set(selected); s.has(id)?s.delete(id):s.add(id); setSelected(s); };
+  const removeSelected = async () => {
+    if(!confirm(`Eliminar ${selected.size} volumenes?`))return;
+    let ok=0;
+    for(const name of selected){ const v=vols.find(x=>x.Name===name); const r=await api('volume-remove',{method:'POST',body:{volume_name:name,host:v?._host||''}}); if(r.success)ok++; }
+    toast(`${ok} volumenes eliminados`,'success'); setSelected(new Set());
+  };
+
+  return <>
+    <div className="card" style={{display:'flex',alignItems:'center',gap:8,padding:'8px 12px',marginBottom:12}}>
+      <span style={{fontSize:13,fontWeight:600}}>Volumes</span>
+      <input placeholder="Search..." value={filter} onChange={e=>{setFilter(e.target.value);setPage(1);}} style={{maxWidth:200,padding:'4px 8px'}} />
+      <button className="btn btn-sm btn-danger" disabled={selected.size===0} onClick={removeSelected}>Remove</button>
+    </div>
+    <div className="card" style={{overflowX:'auto',padding:0}}>
+      <table>
+        <thead><tr><th style={{width:30}}><input type="checkbox" onChange={()=>{if(selected.size===paged.length)setSelected(new Set());else setSelected(new Set(paged.map(v=>v.Name)));}} checked={selected.size===paged.length&&paged.length>0}/></th><th>Name</th><th>Stack</th><th>Driver</th><th>Mount point</th><th>Created</th><th>Node</th></tr></thead>
+        <tbody>{paged.map((v,i) => <tr key={i}>
+          <td><input type="checkbox" checked={selected.has(v.Name)} onChange={()=>toggle(v.Name)}/></td>
+          <td><strong style={{color:'var(--blue)',fontSize:13}}>{v.Name?.length>35 ? v.Name.substring(0,35)+'...' : v.Name}</strong></td>
+          <td>{v.Stack ? <span className="badge badge-blue">{v.Stack}</span> : '-'}</td>
+          <td>{v.Driver}</td>
+          <td style={{fontSize:12,fontFamily:'monospace',maxWidth:350,overflow:'hidden',textOverflow:'ellipsis'}} title={v.Mountpoint}>{v.Mountpoint}</td>
+          <td style={{fontSize:12,color:'var(--muted)',whiteSpace:'nowrap'}}>{v.CreatedAt?.substring(0,19)||'-'}</td>
+          <td><span className="badge badge-muted">{v._node||'-'}</span></td>
+        </tr>)}</tbody>
+      </table>
+    </div>
+    <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginTop:8}}>
+      <span style={{fontSize:12,color:'var(--muted)'}}>{filtered.length} volumenes</span>
+      {totalPages>1 && <div style={{display:'flex',gap:2}}>
+        <button className="btn btn-sm" disabled={page<=1} onClick={()=>setPage(page-1)}>‹</button>
+        {Array.from({length:Math.min(totalPages,5)},(_,i)=><button key={i+1} className={`btn btn-sm ${page===i+1?'btn-primary':''}`} onClick={()=>setPage(i+1)}>{i+1}</button>)}
+        {totalPages>5 && <><span style={{color:'var(--muted)'}}>...</span><button className="btn btn-sm" onClick={()=>setPage(totalPages)}>{totalPages}</button></>}
+        <button className="btn btn-sm" disabled={page>=totalPages} onClick={()=>setPage(page+1)}>›</button>
+      </div>}
+    </div>
+  </>;
 }
 
-// Images
-function Images({ data }) {
+// Images — Portainer style with Pull, multi-node, Host column, Remove
+function Images({ data, toast }) {
+  const [filter, setFilter] = useState('');
+  const [selected, setSelected] = useState(new Set());
+  const [pullImage, setPullImage] = useState('');
+  const [pullHost, setPullHost] = useState('');
+  const [pulling, setPulling] = useState(false);
+  const [page, setPage] = useState(1);
+  const perPage = 10;
   const imgs = data?.images || [];
-  return <div className="card">
-    <table>
-      <thead><tr><th>Repositorio</th><th>Tag</th><th>ID</th><th>Size</th><th>Created</th></tr></thead>
-      <tbody>{imgs.map((img,i) => <tr key={i}>
-        <td><strong>{img.Repository}</strong></td>
-        <td><span className="badge badge-blue">{img.Tag}</span></td>
-        <td style={{fontFamily:'monospace',fontSize:12}}>{(img.ID||'').substring(0,19)}</td>
-        <td>{img.Size}</td>
-        <td style={{fontSize:12,color:'var(--muted)'}}>{img.CreatedSince || img.CreatedAt}</td>
-      </tr>)}</tbody>
-    </table>
-  </div>;
+  const filtered = imgs.filter(img => {
+    const f = filter.toLowerCase();
+    return !f || (img.Repository||'').toLowerCase().includes(f) || (img.Tag||'').toLowerCase().includes(f) || (img._node||'').toLowerCase().includes(f);
+  });
+  const totalPages = Math.ceil(filtered.length / perPage);
+  const paged = filtered.slice((page-1)*perPage, page*perPage);
+  const toggle = id => { const s=new Set(selected); s.has(id)?s.delete(id):s.add(id); setSelected(s); };
+
+  // Get unique hosts for pull dropdown
+  const hosts = [...new Set(imgs.map(i=>i._node).filter(Boolean))];
+
+  const doPull = async () => {
+    if(!pullImage)return;
+    setPulling(true);
+    const body = {image:pullImage};
+    if(pullHost){
+      const img = imgs.find(i=>i._node===pullHost);
+      if(img) body.host = img._host;
+    }
+    const r = await api('image-pull',{method:'POST',body});
+    setPulling(false);
+    if(r.success) toast('Imagen descargada','success');
+    else toast(r.error||'Error','error');
+  };
+
+  const removeSelected = async () => {
+    if(!confirm(`Eliminar ${selected.size} imagenes?`))return;
+    let ok=0;
+    for(const key of selected){
+      const [id,host] = key.split('|');
+      const r = await api('image-remove',{method:'POST',body:{image_id:id,host}});
+      if(r.success)ok++;
+    }
+    toast(`${ok} imagenes eliminadas`,'success'); setSelected(new Set());
+  };
+
+  // Check if image is used by running containers
+  const isUnused = (img) => (img.Repository||'')==='<none>' || (img.Tag||'')==='<none>';
+
+  return <>
+    {/* Pull image section */}
+    <div className="card" style={{marginBottom:12}}>
+      <h4 style={{fontSize:14,fontWeight:600,marginBottom:12}}>Pull image</h4>
+      <div style={{display:'flex',gap:8,alignItems:'flex-end'}}>
+        <div style={{flex:1}}>
+          <label style={{fontSize:12,color:'var(--muted)',display:'block',marginBottom:4}}>Image</label>
+          <div style={{display:'flex',gap:0}}>
+            <span style={{background:'var(--border)',padding:'6px 10px',borderRadius:'6px 0 0 6px',fontSize:12,color:'var(--muted)'}}>docker.io</span>
+            <input value={pullImage} onChange={e=>setPullImage(e.target.value)} placeholder="e.g. nginx:latest" style={{borderRadius:'0 6px 6px 0',borderLeft:'none'}} />
+          </div>
+        </div>
+        <div>
+          <label style={{fontSize:12,color:'var(--muted)',display:'block',marginBottom:4}}>Node</label>
+          <select value={pullHost} onChange={e=>setPullHost(e.target.value)} style={{width:160}}>
+            <option value="">Any (manager)</option>
+            {hosts.map(h=><option key={h} value={h}>{h}</option>)}
+          </select>
+        </div>
+        <button className="btn btn-primary" onClick={doPull} disabled={pulling||!pullImage}>
+          {pulling ? <><span className="spinner" style={{width:14,height:14}}/> Pulling...</> : 'Pull the image'}
+        </button>
+      </div>
+    </div>
+
+    {/* Image list */}
+    <div className="card" style={{display:'flex',alignItems:'center',gap:8,padding:'8px 12px',marginBottom:12}}>
+      <span style={{fontSize:13,fontWeight:600}}>Images</span>
+      <input placeholder="Search..." value={filter} onChange={e=>{setFilter(e.target.value);setPage(1);}} style={{maxWidth:200,padding:'4px 8px'}} />
+      <button className="btn btn-sm btn-danger" disabled={selected.size===0} onClick={removeSelected}>Remove</button>
+      <div style={{marginLeft:'auto',fontSize:11,color:'var(--muted)'}}>{imgs.length} imagenes en {hosts.length} nodos</div>
+    </div>
+    <div className="card" style={{overflowX:'auto',padding:0}}>
+      <table>
+        <thead><tr>
+          <th style={{width:30}}><input type="checkbox" onChange={()=>{if(selected.size===paged.length)setSelected(new Set());else setSelected(new Set(paged.map(i=>`${i.ID}|${i._host}`)));}} checked={selected.size===paged.length&&paged.length>0}/></th>
+          <th>Id</th><th>Tags</th><th>Size</th><th>Created</th><th>Host</th>
+        </tr></thead>
+        <tbody>{paged.map((img,i) => {
+          const key = `${img.ID}|${img._host}`;
+          const tag = `${img.Repository}:${img.Tag}`;
+          const unused = isUnused(img);
+          return <tr key={i}>
+            <td><input type="checkbox" checked={selected.has(key)} onChange={()=>toggle(key)}/></td>
+            <td style={{fontFamily:'monospace',fontSize:12,color:'var(--blue)'}}>{(img.ID||'').substring(0,25)}...</td>
+            <td>{tag !== '<none>:<none>' ? tag : '-'} {unused && <span className="badge badge-yellow" style={{marginLeft:4}}>Unused</span>}</td>
+            <td>{img.Size}</td>
+            <td style={{fontSize:12,color:'var(--muted)',whiteSpace:'nowrap'}}>{img.CreatedAt?.substring(0,19) || img.CreatedSince}</td>
+            <td><span className="badge badge-muted">{img._node}</span></td>
+          </tr>;
+        })}</tbody>
+      </table>
+    </div>
+    <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginTop:8}}>
+      <span style={{fontSize:12,color:'var(--muted)'}}>{filtered.length} imagenes</span>
+      {totalPages>1 && <div style={{display:'flex',gap:2}}>
+        <button className="btn btn-sm" disabled={page<=1} onClick={()=>setPage(page-1)}>‹</button>
+        {Array.from({length:Math.min(totalPages,5)},(_,i)=><button key={i+1} className={`btn btn-sm ${page===i+1?'btn-primary':''}`} onClick={()=>setPage(i+1)}>{i+1}</button>)}
+        {totalPages>5 && <><span style={{color:'var(--muted)'}}>...</span><button className="btn btn-sm" onClick={()=>setPage(totalPages)}>{totalPages}</button></>}
+        <button className="btn btn-sm" disabled={page>=totalPages} onClick={()=>setPage(page+1)}>›</button>
+      </div>}
+    </div>
+  </>;
 }
 
 // Settings
@@ -1073,10 +1361,10 @@ function App() {
       {tab==='nodes' && <Nodes data={nodes} />}
       {tab==='services' && <Services data={services} onScale={scaleService} onRestart={doRestart} onLogs={id=>showLogs(id,'service')} onTasks={showTasks} toast={toast} />}
       {tab==='stacks' && <Stacks data={stacks} onRemove={doStackRemove} toast={toast} />}
-      {tab==='containers' && <Containers data={containers} onLogs={id=>showLogs(id,'container')} onAction={doContainerAction} />}
-      {tab==='networks' && <Networks data={networks} />}
-      {tab==='volumes' && <Volumes data={volumes} />}
-      {tab==='images' && <Images data={images} />}
+      {tab==='containers' && <Containers data={containers} onLogs={(id,host)=>showLogs(id,'container')} onAction={(id,action,reload,host)=>{if(reload){loadTab('containers');return;}doContainerAction(id,action);}} toast={toast} />}
+      {tab==='networks' && <Networks data={networks} toast={toast} />}
+      {tab==='volumes' && <Volumes data={volumes} toast={toast} />}
+      {tab==='images' && <Images data={images} toast={toast} />}
       {tab==='settings' && <Settings onSave={()=>loadTab('dashboard')} toast={toast} />}
     </div>
 

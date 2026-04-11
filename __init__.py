@@ -304,11 +304,30 @@ def _fetch_stacks():
 
 
 def _fetch_containers():
-    """Fetch all containers across the swarm (runs on current node only for now)."""
-    containers = _docker_json(
-        'docker ps -a --format "{{json .}}"'
-    ) or []
-    return containers
+    """Fetch containers from ALL swarm nodes via SSH."""
+    cfg = _load_config()
+    hosts = cfg.get('swarm_hosts', [])
+    all_containers = []
+
+    for h in hosts:
+        raw = None
+        out, err, code = _ssh_exec(
+            h['host'], h['user'], h['password'],
+            'docker ps -a --format "{{json .}}" --no-trunc'
+        )
+        if code == 0 and out.strip():
+            for line in out.strip().split('\n'):
+                line = line.strip()
+                if line:
+                    try:
+                        c = json.loads(line)
+                        c['_node'] = h.get('name', h['host'])
+                        c['_host'] = h['host']
+                        all_containers.append(c)
+                    except json.JSONDecodeError:
+                        pass
+
+    return all_containers
 
 
 def _fetch_tasks(service_id):
@@ -320,21 +339,111 @@ def _fetch_tasks(service_id):
 
 
 def _fetch_networks():
-    """Fetch Docker networks."""
-    networks = _docker_json('docker network ls --format "{{json .}}"') or []
-    return networks
+    """Fetch Docker networks from ALL nodes with IPAM details."""
+    cfg = _load_config()
+    hosts = cfg.get('swarm_hosts', [])
+    all_nets = []
+    seen = set()
+
+    for h in hosts:
+        out, err, code = _ssh_exec(
+            h['host'], h['user'], h['password'],
+            'docker network ls -q | xargs -I{} docker network inspect {} --format "{{json .}}" 2>/dev/null'
+        )
+        if code == 0 and out.strip():
+            for line in out.strip().split('\n'):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    n = json.loads(line)
+                    nid = n.get('Id', '')
+                    if nid in seen:
+                        continue
+                    seen.add(nid)
+                    ipam = n.get('IPAM', {}).get('Config', [{}])
+                    ipam0 = ipam[0] if ipam else {}
+                    labels = n.get('Labels', {})
+                    all_nets.append({
+                        'Name': n.get('Name', ''),
+                        'ID': nid[:12],
+                        'Driver': n.get('Driver', ''),
+                        'Scope': n.get('Scope', ''),
+                        'Attachable': n.get('Attachable', False),
+                        'Internal': n.get('Internal', False),
+                        'IPAM_Driver': n.get('IPAM', {}).get('Driver', 'default'),
+                        'Subnet': ipam0.get('Subnet', ''),
+                        'Gateway': ipam0.get('Gateway', ''),
+                        'IPRange': ipam0.get('IPRange', ''),
+                        'Stack': labels.get('com.docker.stack.namespace', ''),
+                        'System': n.get('Name', '') in ('bridge', 'host', 'none', 'ingress', 'docker_gwbridge'),
+                        '_node': h.get('name', h['host']),
+                    })
+                except json.JSONDecodeError:
+                    pass
+    return all_nets
 
 
 def _fetch_volumes():
-    """Fetch Docker volumes."""
-    volumes = _docker_json('docker volume ls --format "{{json .}}"') or []
-    return volumes
+    """Fetch Docker volumes from ALL nodes with details."""
+    cfg = _load_config()
+    hosts = cfg.get('swarm_hosts', [])
+    all_vols = []
+
+    for h in hosts:
+        out, err, code = _ssh_exec(
+            h['host'], h['user'], h['password'],
+            'docker volume ls -q | xargs -I{} docker volume inspect {} --format "{{json .}}" 2>/dev/null'
+        )
+        if code == 0 and out.strip():
+            for line in out.strip().split('\n'):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    v = json.loads(line)
+                    labels = v.get('Labels', {}) or {}
+                    all_vols.append({
+                        'Name': v.get('Name', ''),
+                        'Driver': v.get('Driver', ''),
+                        'Scope': v.get('Scope', ''),
+                        'Mountpoint': v.get('Mountpoint', ''),
+                        'CreatedAt': v.get('CreatedAt', ''),
+                        'Stack': labels.get('com.docker.stack.namespace', ''),
+                        'Labels': labels,
+                        '_node': h.get('name', h['host']),
+                        '_host': h['host'],
+                    })
+                except json.JSONDecodeError:
+                    pass
+    return all_vols
 
 
 def _fetch_images():
-    """Fetch Docker images."""
-    images = _docker_json('docker image ls --format "{{json .}}"') or []
-    return images
+    """Fetch Docker images from ALL nodes."""
+    cfg = _load_config()
+    hosts = cfg.get('swarm_hosts', [])
+    all_imgs = []
+
+    for h in hosts:
+        out, err, code = _ssh_exec(
+            h['host'], h['user'], h['password'],
+            'docker image ls --format "{{json .}}" --no-trunc'
+        )
+        if code == 0 and out.strip():
+            for line in out.strip().split('\n'):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    img = json.loads(line)
+                    img['_node'] = h.get('name', h['host'])
+                    img['_host'] = h['host']
+                    # Check if in use
+                    all_imgs.append(img)
+                except json.JSONDecodeError:
+                    pass
+    return all_imgs
 
 
 # ---------------------------------------------------------------------------
@@ -1089,18 +1198,34 @@ def _api_stack_remove():
 
 
 def _api_container_action():
-    """POST — Container action. Body: {container_id, action: start|stop|restart}"""
+    """POST — Container action. Body: {container_id, action, host (optional)}
+    Actions: start, stop, restart, kill, pause, unpause, remove"""
     data = request.get_json() or {}
     container_id = data.get('container_id', '')
     action = data.get('action', '')
+    host = data.get('host', '')  # target node IP
 
-    if not container_id or action not in ('start', 'stop', 'restart'):
-        return {'error': 'container_id and action (start/stop/restart) required'}, 400
+    valid_actions = ('start', 'stop', 'restart', 'kill', 'pause', 'unpause', 'remove')
+    if not container_id or action not in valid_actions:
+        return {'error': f'container_id and action ({"/".join(valid_actions)}) required'}, 400
 
     if not all(c.isalnum() or c in '-_.' for c in container_id):
         return {'error': 'Invalid container_id'}, 400
 
-    result = _docker_cmd(f'docker {action} {container_id}')
+    # Map action to docker command
+    cmd = f'docker rm -f {container_id}' if action == 'remove' else f'docker {action} {container_id}'
+
+    # If host specified, execute on that specific node
+    if host:
+        cfg = _load_config()
+        target = next((h for h in cfg.get('swarm_hosts', []) if h['host'] == host), None)
+        if target:
+            result = _docker_cmd(cmd, host_cfg=target)
+        else:
+            result = _docker_cmd(cmd)
+    else:
+        result = _docker_cmd(cmd)
+
     if result is not None:
         log_audit(_get_username(), f'docker.container_{action}',
                   f'{action} container {container_id}')
@@ -1225,6 +1350,97 @@ def _api_serve_ui():
     return {'error': 'UI not found'}, 404
 
 
+def _api_image_pull():
+    """POST — Pull an image on a specific node. Body: {image, host}"""
+    data = request.get_json() or {}
+    image = data.get('image', '')
+    host = data.get('host', '')
+    if not image:
+        return {'error': 'image required'}, 400
+    # Sanitize image name
+    if any(c in image for c in [';', '&', '|', '`', '$']):
+        return {'error': 'Invalid image name'}, 400
+
+    if host:
+        cfg = _load_config()
+        target = next((h for h in cfg.get('swarm_hosts', []) if h['host'] == host), None)
+        if target:
+            out, err, code = _ssh_exec(target['host'], target['user'], target['password'],
+                                       f'docker pull {image} 2>&1', timeout=120)
+            if code == 0:
+                log_audit(_get_username(), 'docker.image_pull', f'Pulled {image} on {host}')
+                return {'success': True, 'message': out}
+            return {'error': err or out}, 500
+    result = _docker_cmd(f'docker pull {image} 2>&1')
+    if result is not None:
+        log_audit(_get_username(), 'docker.image_pull', f'Pulled {image}')
+        return {'success': True, 'message': result}
+    return {'error': 'Pull failed'}, 500
+
+
+def _api_image_remove():
+    """POST — Remove image(s). Body: {image_id, host}"""
+    data = request.get_json() or {}
+    image_id = data.get('image_id', '')
+    host = data.get('host', '')
+    if not image_id:
+        return {'error': 'image_id required'}, 400
+    if not all(c.isalnum() or c in '-_.:/' for c in image_id):
+        return {'error': 'Invalid image_id'}, 400
+
+    cmd = f'docker rmi {image_id} 2>&1'
+    if host:
+        cfg = _load_config()
+        target = next((h for h in cfg.get('swarm_hosts', []) if h['host'] == host), None)
+        if target:
+            result = _docker_cmd(cmd, host_cfg=target)
+        else:
+            result = _docker_cmd(cmd)
+    else:
+        result = _docker_cmd(cmd)
+    if result is not None:
+        log_audit(_get_username(), 'docker.image_removed', f'Removed image {image_id}')
+        return {'success': True, 'message': result}
+    return {'error': 'Remove failed'}, 500
+
+
+def _api_volume_remove():
+    """POST — Remove volume. Body: {volume_name, host}"""
+    data = request.get_json() or {}
+    name = data.get('volume_name', '')
+    host = data.get('host', '')
+    if not name or not all(c.isalnum() or c in '-_.' for c in name):
+        return {'error': 'Valid volume_name required'}, 400
+
+    cmd = f'docker volume rm {name} 2>&1'
+    if host:
+        cfg = _load_config()
+        target = next((h for h in cfg.get('swarm_hosts', []) if h['host'] == host), None)
+        if target:
+            result = _docker_cmd(cmd, host_cfg=target)
+        else:
+            result = _docker_cmd(cmd)
+    else:
+        result = _docker_cmd(cmd)
+    if result is not None:
+        log_audit(_get_username(), 'docker.volume_removed', f'Removed volume {name}')
+        return {'success': True, 'message': result}
+    return {'error': 'Remove failed (volume may be in use)'}, 500
+
+
+def _api_network_remove():
+    """POST — Remove network. Body: {network_name}"""
+    data = request.get_json() or {}
+    name = data.get('network_name', '')
+    if not name or not all(c.isalnum() or c in '-_.' for c in name):
+        return {'error': 'Valid network_name required'}, 400
+    result = _docker_cmd(f'docker network rm {name} 2>&1')
+    if result is not None:
+        log_audit(_get_username(), 'docker.network_removed', f'Removed network {name}')
+        return {'success': True, 'message': result}
+    return {'error': 'Remove failed (network may be in use)'}, 500
+
+
 def _api_refresh():
     """POST — Force refresh all cached data."""
     with _cache_lock:
@@ -1303,6 +1519,10 @@ def register(app):
         'stack-start': _api_stack_start,
         'stack-deploy': _api_stack_deploy,
         'stack-remove': _api_stack_remove,
+        'image-pull': _api_image_pull,
+        'image-remove': _api_image_remove,
+        'volume-remove': _api_volume_remove,
+        'network-remove': _api_network_remove,
         'config': _api_get_config,
         'config/save': _api_save_config,
         'test-connection': _api_test_connection,
