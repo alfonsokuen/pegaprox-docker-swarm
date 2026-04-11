@@ -61,27 +61,40 @@ Born from [Feature Request #152](https://github.com/PegaProx/project-pegaprox/is
 
 ## Installation
 
-### Quick Install
+### One-Line Install (Recommended)
+
+```bash
+curl -sSL https://raw.githubusercontent.com/alfonsokuen/pegaprox-docker-swarm/main/install.sh | sudo bash
+```
+
+The installer will:
+- Download the plugin
+- Prompt for your Swarm manager SSH credentials
+- Enable the plugin in PegaProx
+- Integrate into the sidebar and topology view
+- Optionally set up nginx reverse proxy (for VNC console)
+- Configure auto-patch for PegaProx update persistence
+- Rebuild the frontend and restart PegaProx
+
+### Manual Install
 
 ```bash
 cd /opt/PegaProx/plugins/
 git clone https://github.com/alfonsokuen/pegaprox-docker-swarm.git docker_swarm
 cp docker_swarm/config.example.json docker_swarm/config.json
+# Edit config.json with your Swarm SSH credentials
 chown -R pegaprox:pegaprox docker_swarm/
 chmod 600 docker_swarm/config.json
+# Enable: Settings > Plugins > Rescan > Enable "Docker Swarm Manager"
+# Integrate into sidebar + topology:
+sudo bash docker_swarm/patch-pegaprox.sh
 ```
 
-Then in PegaProx UI: **Settings > Plugins > Rescan > Enable "Docker Swarm Manager"**
+### Uninstall
 
-Edit `config.json` with your Swarm manager SSH credentials, or configure via the plugin Settings tab.
-
-### Manual Install
-
-1. Download/copy the plugin files to `/opt/PegaProx/plugins/docker_swarm/`
-2. Copy `config.example.json` to `config.json` and edit with your SSH credentials
-3. Set ownership: `chown -R pegaprox:pegaprox /opt/PegaProx/plugins/docker_swarm/`
-4. Protect credentials: `chmod 600 /opt/PegaProx/plugins/docker_swarm/config.json`
-5. In PegaProx: Settings > Plugins > Rescan > Enable
+```bash
+sudo bash /opt/PegaProx/plugins/docker_swarm/uninstall.sh
+```
 
 ## Configuration
 
