@@ -1467,6 +1467,67 @@ def _api_network_remove():
     return {'error': 'Remove failed (network may be in use)'}, 500
 
 
+def _api_topology():
+    """GET — Return Swarm data formatted for PegaProx TopologyView multiCluster."""
+    overview = _cache_get('overview') or _fetch_overview()
+    services = _cache_get('services') or _fetch_services()
+    nodes_data = _cache_get('nodes') or _fetch_nodes()
+
+    if not overview or overview.get('error'):
+        return {'nodes': [], 'resources': []}
+
+    # Build nodes array matching PegaProx format: {name, status, cpu_percent, mem_percent, ...}
+    topo_nodes = []
+    for n in (nodes_data or []):
+        res = n.get('resources', {})
+        topo_nodes.append({
+            'name': n.get('Hostname', n.get('addr', 'unknown')),
+            'status': 'online' if n.get('state', n.get('Status', '')) in ('ready', 'Ready') else 'offline',
+            'cpu_percent': 0,
+            'mem_percent': 0,
+            'maxmem': res.get('memory_bytes', 0),
+            'mem': 0,
+        })
+
+    # Build resources array: each service as a "VM" for topology rendering
+    topo_resources = []
+    for svc in (services or []):
+        svc_name = svc.get('Name', '')
+        replicas = svc.get('Replicas', '0/0')
+        parts = replicas.split('/')
+        running = int(parts[0]) if parts[0].isdigit() else 0
+
+        # Assign to a node (use constraints or round-robin)
+        node_name = ''
+        constraints = svc.get('constraints', [])
+        for c in constraints:
+            if 'node.hostname' in c and '==' in c:
+                node_name = c.split('==')[-1].strip()
+                break
+        if not node_name and topo_nodes:
+            # Round-robin assignment for visualization
+            idx = hash(svc_name) % len(topo_nodes)
+            node_name = topo_nodes[idx]['name']
+
+        topo_resources.append({
+            'vmid': hash(svc_name) % 9000 + 1000,
+            'name': svc_name.split('_')[-1] if '_' in svc_name else svc_name,
+            'type': 'lxc',  # show as container icon
+            'status': 'running' if running > 0 else 'stopped',
+            'node': node_name,
+            'cpu': 0,
+            'mem': 0,
+            'maxmem': 0,
+        })
+
+    return {
+        'id': 'docker_swarm',
+        'name': 'Docker Swarm',
+        'nodes': topo_nodes,
+        'resources': topo_resources,
+    }
+
+
 def _api_refresh():
     """POST — Force refresh all cached data."""
     with _cache_lock:
@@ -1545,6 +1606,7 @@ def register(app):
         'stack-start': _api_stack_start,
         'stack-deploy': _api_stack_deploy,
         'stack-remove': _api_stack_remove,
+        'topology': _api_topology,
         'image-pull': _api_image_pull,
         'image-remove': _api_image_remove,
         'volume-remove': _api_volume_remove,

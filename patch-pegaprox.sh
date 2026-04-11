@@ -147,8 +147,61 @@ CONTENT_EOF
     fi
 fi
 
-# ---------- 4. Rebuild frontend ----------
-echo -n "[4/4] Rebuilding frontend... "
+# ---------- 4. Inject Swarm into TopologyView ----------
+echo -n "[4/5] Topology Swarm injection... "
+if grep -q "docker_swarm.*topology" "$DASHBOARD"; then
+    echo -e "${YELLOW}already present${NC}"
+else
+    # Find the multiCluster prop in TopologyView (sidebarTopology section)
+    # Pattern: multiCluster={clusters.filter(c => c.connected).map(
+    TOPO_LINE=$(grep -n "multiCluster={clusters.filter(c => c.connected).map(" "$DASHBOARD" | tail -1 | cut -d: -f1)
+    if [ -n "$TOPO_LINE" ]; then
+        # Find the closing of the .map() — look for the })} after the return block
+        # We need to append .concat() after the closing })}
+        # Strategy: add a state + effect to fetch swarm topology, then concat to multiCluster
+
+        # 1. Add swarm topology state near other topology states
+        TOPO_STATE_LINE=$(grep -n "const \[sidebarTopology" "$DASHBOARD" | head -1 | cut -d: -f1)
+        if [ -n "$TOPO_STATE_LINE" ]; then
+            sed -i "${TOPO_STATE_LINE}a\\            const [swarmTopoData, setSwarmTopoData] = useState(null); // docker_swarm topology" "$DASHBOARD"
+        fi
+
+        # 2. Add effect to fetch swarm topology data
+        TOPO_EFFECT_LINE=$(grep -n "if (!sidebarTopology) return;" "$DASHBOARD" | head -1 | cut -d: -f1)
+        if [ -n "$TOPO_EFFECT_LINE" ]; then
+            AFTER_EFFECT=$((TOPO_EFFECT_LINE + 5))
+            sed -i "${AFTER_EFFECT}a\\            // docker_swarm: fetch swarm topology for multi-cluster view\\
+            useEffect(() => {\\
+                if (!sidebarTopology) return;\\
+                fetch('/api/plugins/docker_swarm/api/topology', {credentials: 'include'})\\
+                    .then(r => r.json()).then(d => { if (d && d.nodes) setSwarmTopoData(d); })\\
+                    .catch(() => {});\\
+            }, [sidebarTopology]);" "$DASHBOARD"
+        fi
+
+        # 3. Concat swarm data to multiCluster prop
+        # Find: })} at the end of the .map() block and add .concat()
+        # The pattern is: })} followed by isCorporate={true}
+        sed -i "s|})}\n\s*isCorporate={true}|})}.concat(swarmTopoData ? [swarmTopoData] : [])\n                                                isCorporate={true}|" "$DASHBOARD"
+        # If multiline sed didn't work, try single-line approach
+        # Find the line with isCorporate={true} right after the multiCluster prop
+        CORP_LINE=$(grep -n "isCorporate={true}" "$DASHBOARD" | tail -1 | cut -d: -f1)
+        if [ -n "$CORP_LINE" ]; then
+            MULTI_END=$((CORP_LINE - 1))
+            MULTI_LINE_CONTENT=$(sed -n "${MULTI_END}p" "$DASHBOARD")
+            if echo "$MULTI_LINE_CONTENT" | grep -q "})}$"; then
+                sed -i "${MULTI_END}s|})}\$|})}.concat(swarmTopoData ? [swarmTopoData] : [])|" "$DASHBOARD"
+            fi
+        fi
+
+        echo -e "${GREEN}PATCHED${NC}"
+    else
+        echo -e "${RED}multiCluster prop not found${NC}"
+    fi
+fi
+
+# ---------- 5. Rebuild frontend ----------
+echo -n "[5/5] Rebuilding frontend... "
 if command -v node &> /dev/null; then
     cd "$PEGAPROX_DIR"
     bash web/Dev/build.sh > /dev/null 2>&1
