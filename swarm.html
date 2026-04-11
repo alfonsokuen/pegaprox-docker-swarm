@@ -1,0 +1,641 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Docker Swarm Manager — PegaProx</title>
+<script src="/static/js/react.production.min.js"></script>
+<script src="/static/js/react-dom.production.min.js"></script>
+<script src="/static/js/babel.min.js"></script>
+<link href="/static/css/tailwind.min.css" rel="stylesheet">
+<style>
+:root { --accent: #e57000; --bg: #0f1117; --card: #1a1d27; --border: #2a2d3a; --text: #e4e4e7; --muted: #71717a; --green: #22c55e; --red: #ef4444; --yellow: #eab308; --blue: #3b82f6; }
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 14px; }
+.card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+.btn { padding: 6px 14px; border-radius: 6px; border: 1px solid var(--border); background: var(--card); color: var(--text); cursor: pointer; font-size: 13px; transition: all .15s; display: inline-flex; align-items: center; gap: 6px; }
+.btn:hover { border-color: var(--accent); }
+.btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn-primary:hover { background: #cc6200; }
+.btn-danger { background: var(--red); border-color: var(--red); color: #fff; }
+.btn-danger:hover { background: #dc2626; }
+.btn-sm { padding: 3px 8px; font-size: 12px; }
+.badge { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 9999px; font-size: 11px; font-weight: 600; }
+.badge-green { background: rgba(34,197,94,.15); color: var(--green); }
+.badge-red { background: rgba(239,68,68,.15); color: var(--red); }
+.badge-yellow { background: rgba(234,179,8,.15); color: var(--yellow); }
+.badge-blue { background: rgba(59,130,246,.15); color: var(--blue); }
+.badge-muted { background: rgba(113,113,122,.15); color: var(--muted); }
+table { width: 100%; border-collapse: collapse; }
+th { text-align: left; padding: 8px 12px; font-size: 11px; text-transform: uppercase; color: var(--muted); border-bottom: 1px solid var(--border); }
+td { padding: 8px 12px; border-bottom: 1px solid var(--border); font-size: 13px; }
+tr:hover { background: rgba(255,255,255,.03); }
+.tabs { display: flex; gap: 2px; background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 3px; margin-bottom: 16px; overflow-x: auto; }
+.tab { padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 500; color: var(--muted); transition: all .15s; white-space: nowrap; }
+.tab:hover { color: var(--text); }
+.tab.active { background: var(--accent); color: #fff; }
+.stat-card { text-align: center; }
+.stat-value { font-size: 28px; font-weight: 700; color: var(--accent); }
+.stat-label { font-size: 12px; color: var(--muted); margin-top: 4px; }
+.progress-bar { height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; }
+.progress-fill { height: 100%; border-radius: 3px; transition: width .3s; }
+input, textarea, select { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; color: var(--text); font-size: 13px; width: 100%; }
+input:focus, textarea:focus, select:focus { outline: none; border-color: var(--accent); }
+.log-viewer { background: #000; color: #0f0; font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: 12px; padding: 12px; border-radius: 8px; max-height: 500px; overflow: auto; white-space: pre-wrap; word-break: break-all; line-height: 1.5; }
+.modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: flex; align-items: center; justify-content: center; z-index: 1000; }
+.modal { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 24px; max-width: 600px; width: 90%; max-height: 80vh; overflow-y: auto; }
+.toast { position: fixed; bottom: 20px; right: 20px; padding: 12px 20px; border-radius: 8px; font-size: 13px; z-index: 9999; animation: slideIn .3s ease; }
+@keyframes slideIn { from { transform: translateY(20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+.spinner { border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; width: 20px; height: 20px; animation: spin .6s linear infinite; display: inline-block; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .4; } }
+.live-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); animation: pulse 2s ease-in-out infinite; display: inline-block; }
+.stat-value { transition: all .4s ease; }
+.progress-fill { transition: width .6s ease-in-out; }
+.countdown-bar { height: 2px; background: var(--accent); transition: width 1s linear; position: absolute; bottom: 0; left: 0; border-radius: 1px; }
+.fade-in { animation: fadeIn .3s ease; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+.sidebar { width: 220px; min-height: 100vh; background: var(--card); border-right: 1px solid var(--border); padding: 16px 0; position: fixed; left: 0; top: 0; }
+.sidebar-item { padding: 10px 20px; cursor: pointer; display: flex; align-items: center; gap: 10px; color: var(--muted); transition: all .15s; font-size: 13px; }
+.sidebar-item:hover { color: var(--text); background: rgba(255,255,255,.03); }
+.sidebar-item.active { color: var(--accent); background: rgba(229,112,0,.1); border-right: 3px solid var(--accent); }
+.main { margin-left: 220px; padding: 20px; }
+.header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
+.grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+.grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
+@media (max-width: 768px) { .sidebar { display: none; } .main { margin-left: 0; } }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useCallback, useRef } = React;
+
+const API = '/api/plugins/docker_swarm/api';
+
+async function api(path, opts = {}) {
+  const res = await fetch(`${API}/${path}`, {
+    ...opts,
+    headers: { 'Content-Type': 'application/json', ...opts.headers },
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  });
+  return res.json();
+}
+
+// Format helpers
+const fmtBytes = (b) => {
+  if (!b || b === 0) return '0 B';
+  const u = ['B','KB','MB','GB','TB'];
+  const i = Math.floor(Math.log(b) / Math.log(1024));
+  return (b / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0) + ' ' + u[i];
+};
+
+const fmtUptime = (s) => {
+  if (!s) return '-';
+  const d = Math.floor(s/86400), h = Math.floor((s%86400)/3600), m = Math.floor((s%3600)/60);
+  return d > 0 ? `${d}d ${h}h` : h > 0 ? `${h}h ${m}m` : `${m}m`;
+};
+
+const fmtAgo = (iso) => {
+  if (!iso) return '-';
+  const d = new Date(iso), now = new Date(), diff = (now - d) / 1000;
+  if (diff < 60) return 'just now';
+  if (diff < 3600) return `${Math.floor(diff/60)}m ago`;
+  if (diff < 86400) return `${Math.floor(diff/3600)}h ago`;
+  return `${Math.floor(diff/86400)}d ago`;
+};
+
+// Toast
+function Toast({ msg, type, onClose }) {
+  useEffect(() => { const t = setTimeout(onClose, 3000); return () => clearTimeout(t); }, []);
+  const bg = type === 'error' ? 'var(--red)' : type === 'success' ? 'var(--green)' : 'var(--blue)';
+  return <div className="toast" style={{background: bg, color: '#fff'}}>{msg}</div>;
+}
+
+// Status badge
+function StatusBadge({ status }) {
+  const s = (status || '').toLowerCase();
+  if (['running','ready','active','complete'].includes(s)) return <span className="badge badge-green">{status}</span>;
+  if (['down','failed','error','rejected','shutdown','remove'].includes(s)) return <span className="badge badge-red">{status}</span>;
+  if (['drain','paused','pending','preparing','starting','assigned','accepted','orphaned'].includes(s)) return <span className="badge badge-yellow">{status}</span>;
+  return <span className="badge badge-muted">{status || 'unknown'}</span>;
+}
+
+// Progress bar
+function ProgressBar({ percent, color }) {
+  const c = percent > 90 ? 'var(--red)' : percent > 70 ? 'var(--yellow)' : color || 'var(--green)';
+  return <div className="progress-bar"><div className="progress-fill" style={{width: `${Math.min(100,percent)}%`, background: c}} /></div>;
+}
+
+// Modal
+function Modal({ title, onClose, children }) {
+  return <div className="modal-overlay" onClick={onClose}>
+    <div className="modal" onClick={e => e.stopPropagation()}>
+      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16}}>
+        <h3 style={{fontSize:16,fontWeight:600}}>{title}</h3>
+        <button className="btn btn-sm" onClick={onClose}>X</button>
+      </div>
+      {children}
+    </div>
+  </div>;
+}
+
+// ============== PAGES ==============
+
+// Dashboard
+function Dashboard({ overview, nodeStats, onRefresh, loading }) {
+  if (!overview || overview.error) return <div className="card" style={{textAlign:'center',padding:40}}>
+    <p style={{color:'var(--muted)',marginBottom:12}}>No hay conexion al Swarm</p>
+    <p style={{fontSize:12,color:'var(--red)'}}>{overview?.error || 'Configura un host en la seccion Ajustes'}</p>
+  </div>;
+
+  const sw = overview.swarm || {};
+  return <>
+    <div className="grid-4" style={{marginBottom:16}}>
+      <div className="card stat-card"><div className="stat-value">{sw.nodes_count || 0}</div><div className="stat-label">Nodos</div></div>
+      <div className="card stat-card"><div className="stat-value">{overview.services_count || 0}</div><div className="stat-label">Servicios</div></div>
+      <div className="card stat-card"><div className="stat-value">{sw.containers_running || 0}</div><div className="stat-label">Contenedores</div></div>
+      <div className="card stat-card"><div className="stat-value">{sw.images || 0}</div><div className="stat-label">Imagenes</div></div>
+    </div>
+
+    <div className="grid-3" style={{marginBottom:16}}>
+      <div className="card">
+        <h4 style={{fontSize:13,color:'var(--muted)',marginBottom:8}}>Swarm Info</h4>
+        <div style={{fontSize:13,lineHeight:2}}>
+          <div><strong>Host:</strong> {sw.hostname}</div>
+          <div><strong>Docker:</strong> {sw.docker_version}</div>
+          <div><strong>OS:</strong> {sw.os}</div>
+          <div><strong>Kernel:</strong> {sw.kernel}</div>
+          <div><strong>Managers:</strong> {sw.managers} / <strong>Workers:</strong> {(sw.nodes_count||0)-(sw.managers||0)}</div>
+        </div>
+      </div>
+      <div className="card">
+        <h4 style={{fontSize:13,color:'var(--muted)',marginBottom:8}}>Contenedores</h4>
+        <div style={{display:'flex',gap:16,marginTop:8}}>
+          <div><span style={{fontSize:24,fontWeight:700,color:'var(--green)'}}>{sw.containers_running||0}</span><div style={{fontSize:11,color:'var(--muted)'}}>Running</div></div>
+          <div><span style={{fontSize:24,fontWeight:700,color:'var(--red)'}}>{sw.containers_stopped||0}</span><div style={{fontSize:11,color:'var(--muted)'}}>Stopped</div></div>
+          <div><span style={{fontSize:24,fontWeight:700,color:'var(--yellow)'}}>{sw.containers_paused||0}</span><div style={{fontSize:11,color:'var(--muted)'}}>Paused</div></div>
+        </div>
+      </div>
+      <div className="card">
+        <h4 style={{fontSize:13,color:'var(--muted)',marginBottom:8}}>Disco</h4>
+        {(overview.disk_usage || []).map((d,i) => <div key={i} style={{marginBottom:6}}>
+          <div style={{display:'flex',justifyContent:'space-between',fontSize:12,marginBottom:2}}>
+            <span>{d.Type}</span><span>{d.Size} ({d.Reclaimable} recuperable)</span>
+          </div>
+        </div>)}
+      </div>
+    </div>
+
+    {nodeStats && nodeStats.stats && <div className="card">
+      <h4 style={{fontSize:13,color:'var(--muted)',marginBottom:12}}>Recursos por Nodo</h4>
+      <table>
+        <thead><tr><th>Nodo</th><th>CPU (Load)</th><th>RAM</th><th>Disco</th><th>Uptime</th></tr></thead>
+        <tbody>{nodeStats.stats.map((n,i) => {
+          const memPct = n.mem_total ? ((n.mem_used / n.mem_total) * 100).toFixed(1) : 0;
+          const diskPct = n.disk_total ? ((n.disk_used / n.disk_total) * 100).toFixed(1) : 0;
+          return <tr key={i}>
+            <td><strong>{n.name || n.hostname}</strong><div style={{fontSize:11,color:'var(--muted)'}}>{n.host}</div></td>
+            <td><div style={{marginBottom:4}}>{n.load_1m} / {n.cpu_count} cores</div><ProgressBar percent={(n.load_1m/n.cpu_count)*100} /></td>
+            <td><div style={{marginBottom:4}}>{fmtBytes(n.mem_used)} / {fmtBytes(n.mem_total)} ({memPct}%)</div><ProgressBar percent={memPct} /></td>
+            <td><div style={{marginBottom:4}}>{fmtBytes(n.disk_used)} / {fmtBytes(n.disk_total)} ({diskPct}%)</div><ProgressBar percent={diskPct} /></td>
+            <td>{fmtUptime(n.uptime_seconds)}</td>
+          </tr>;
+        })}</tbody>
+      </table>
+    </div>}
+
+    <div style={{textAlign:'right',marginTop:8,fontSize:11,color:'var(--muted)',display:'flex',alignItems:'center',justifyContent:'flex-end',gap:8}}>
+      <span className="live-dot" /> En vivo — Actualizado: {overview.updated_at ? new Date(overview.updated_at).toLocaleTimeString() : '-'}
+    </div>
+  </>;
+}
+
+// Nodes
+function Nodes({ data }) {
+  if (!data || !data.length) return <div className="card" style={{padding:20,color:'var(--muted)'}}>Sin nodos</div>;
+  return <div className="card">
+    <table>
+      <thead><tr><th>ID</th><th>Hostname</th><th>Status</th><th>Availability</th><th>Role</th><th>Engine</th><th>IP</th><th>CPU</th><th>RAM</th></tr></thead>
+      <tbody>{data.map((n,i) => <tr key={i}>
+        <td style={{fontFamily:'monospace',fontSize:12}}>{(n.ID||'').substring(0,12)}</td>
+        <td><strong>{n.Hostname}</strong></td>
+        <td><StatusBadge status={n.state || n.Status} /></td>
+        <td><StatusBadge status={n.Availability} /></td>
+        <td><span className={`badge ${n.ManagerStatus ? 'badge-blue' : 'badge-muted'}`}>{n.ManagerStatus || 'Worker'}</span></td>
+        <td>{n.engine_version || n.EngineVersion}</td>
+        <td style={{fontFamily:'monospace',fontSize:12}}>{n.addr || '-'}</td>
+        <td>{n.resources?.cpus ? n.resources.cpus.toFixed(0) + ' cores' : '-'}</td>
+        <td>{n.resources?.memory_bytes ? fmtBytes(n.resources.memory_bytes) : '-'}</td>
+      </tr>)}</tbody>
+    </table>
+  </div>;
+}
+
+// Services
+function Services({ data, onScale, onRestart, onLogs, onTasks }) {
+  const [filter, setFilter] = useState('');
+  if (!data || !data.length) return <div className="card" style={{padding:20,color:'var(--muted)'}}>Sin servicios</div>;
+
+  const filtered = data.filter(s => {
+    const name = (s.Name || '').toLowerCase();
+    const stack = (s.stack || '').toLowerCase();
+    const f = filter.toLowerCase();
+    return !f || name.includes(f) || stack.includes(f);
+  });
+
+  return <>
+    <div style={{marginBottom:12}}>
+      <input placeholder="Filtrar servicios..." value={filter} onChange={e=>setFilter(e.target.value)} style={{maxWidth:300}} />
+    </div>
+    <div className="card" style={{overflowX:'auto'}}>
+      <table>
+        <thead><tr><th>Servicio</th><th>Stack</th><th>Image</th><th>Replicas</th><th>Ports</th><th>Updated</th><th>Acciones</th></tr></thead>
+        <tbody>{filtered.map((s,i) => {
+          const img = (s.Image || s.image_full || '').split('@')[0];
+          const shortImg = img.includes('/') ? img.split('/').pop() : img;
+          return <tr key={i}>
+            <td><strong>{s.Name}</strong><div style={{fontSize:11,color:'var(--muted)',fontFamily:'monospace'}}>{(s.ID||'').substring(0,12)}</div></td>
+            <td>{s.stack ? <span className="badge badge-blue">{s.stack}</span> : '-'}</td>
+            <td style={{fontSize:12,maxWidth:200,overflow:'hidden',textOverflow:'ellipsis'}} title={img}>{shortImg}</td>
+            <td><span style={{fontWeight:600}}>{s.Replicas}</span>{s.mode_type === 'global' && <span className="badge badge-muted" style={{marginLeft:4}}>global</span>}</td>
+            <td style={{fontSize:12,fontFamily:'monospace'}}>{s.Ports || '-'}</td>
+            <td style={{fontSize:12,color:'var(--muted)'}}>{fmtAgo(s.updated || s.UpdatedAt)}</td>
+            <td style={{whiteSpace:'nowrap'}}>
+              <button className="btn btn-sm" onClick={()=>onTasks(s)} title="Tasks">Tasks</button>{' '}
+              <button className="btn btn-sm" onClick={()=>onLogs(s.Name||s.ID)} title="Logs">Logs</button>{' '}
+              {s.mode_type !== 'global' && <button className="btn btn-sm" onClick={()=>onScale(s)} title="Scale">Scale</button>}{' '}
+              <button className="btn btn-sm" onClick={()=>onRestart(s.Name||s.ID)} title="Restart">Restart</button>
+            </td>
+          </tr>;
+        })}</tbody>
+      </table>
+    </div>
+    <div style={{marginTop:8,fontSize:12,color:'var(--muted)'}}>{filtered.length} de {data.length} servicios</div>
+  </>;
+}
+
+// Stacks
+function Stacks({ data, onRemove }) {
+  if (!data || !data.length) return <div className="card" style={{padding:20,color:'var(--muted)'}}>Sin stacks</div>;
+  return <div className="card">
+    <table>
+      <thead><tr><th>Stack</th><th>Services</th><th>Acciones</th></tr></thead>
+      <tbody>{data.map((s,i) => <tr key={i}>
+        <td><strong>{s.Name}</strong></td>
+        <td>{s.Services}</td>
+        <td><button className="btn btn-sm btn-danger" onClick={()=>onRemove(s.Name)}>Remove</button></td>
+      </tr>)}</tbody>
+    </table>
+  </div>;
+}
+
+// Containers
+function Containers({ data, onLogs, onAction }) {
+  const [filter, setFilter] = useState('');
+  const containers = data?.containers || [];
+  const filtered = containers.filter(c => {
+    const f = filter.toLowerCase();
+    return !f || (c.Names||'').toLowerCase().includes(f) || (c.Image||'').toLowerCase().includes(f);
+  });
+
+  return <>
+    <div style={{marginBottom:12}}>
+      <input placeholder="Filtrar contenedores..." value={filter} onChange={e=>setFilter(e.target.value)} style={{maxWidth:300}} />
+    </div>
+    <div className="card" style={{overflowX:'auto'}}>
+      <table>
+        <thead><tr><th>Nombre</th><th>Image</th><th>Status</th><th>Ports</th><th>Created</th><th>Acciones</th></tr></thead>
+        <tbody>{filtered.map((c,i) => <tr key={i}>
+          <td><strong>{c.Names}</strong><div style={{fontSize:11,color:'var(--muted)',fontFamily:'monospace'}}>{(c.ID||'').substring(0,12)}</div></td>
+          <td style={{fontSize:12,maxWidth:180,overflow:'hidden',textOverflow:'ellipsis'}}>{c.Image}</td>
+          <td><StatusBadge status={c.State || c.Status?.split(' ')[0]} /><div style={{fontSize:11,color:'var(--muted)'}}>{c.Status}</div></td>
+          <td style={{fontSize:11,fontFamily:'monospace'}}>{c.Ports || '-'}</td>
+          <td style={{fontSize:12,color:'var(--muted)'}}>{c.RunningFor || c.CreatedAt}</td>
+          <td style={{whiteSpace:'nowrap'}}>
+            <button className="btn btn-sm" onClick={()=>onLogs(c.ID||c.Names)}>Logs</button>{' '}
+            <button className="btn btn-sm" onClick={()=>onAction(c.ID||c.Names,'restart')}>Restart</button>{' '}
+            {(c.State||'').toLowerCase()==='running'
+              ? <button className="btn btn-sm" onClick={()=>onAction(c.ID||c.Names,'stop')}>Stop</button>
+              : <button className="btn btn-sm" onClick={()=>onAction(c.ID||c.Names,'start')}>Start</button>
+            }
+          </td>
+        </tr>)}</tbody>
+      </table>
+    </div>
+    <div style={{marginTop:8,fontSize:12,color:'var(--muted)'}}>{filtered.length} de {containers.length} contenedores</div>
+  </>;
+}
+
+// Networks
+function Networks({ data }) {
+  const nets = data?.networks || [];
+  return <div className="card">
+    <table>
+      <thead><tr><th>Nombre</th><th>ID</th><th>Driver</th><th>Scope</th></tr></thead>
+      <tbody>{nets.map((n,i) => <tr key={i}>
+        <td><strong>{n.Name}</strong></td>
+        <td style={{fontFamily:'monospace',fontSize:12}}>{(n.ID||'').substring(0,12)}</td>
+        <td><span className="badge badge-blue">{n.Driver}</span></td>
+        <td>{n.Scope}</td>
+      </tr>)}</tbody>
+    </table>
+  </div>;
+}
+
+// Volumes
+function Volumes({ data }) {
+  const vols = data?.volumes || [];
+  return <div className="card">
+    <table>
+      <thead><tr><th>Nombre</th><th>Driver</th><th>Scope</th><th>Mountpoint</th></tr></thead>
+      <tbody>{vols.map((v,i) => <tr key={i}>
+        <td><strong>{v.Name}</strong></td>
+        <td>{v.Driver}</td>
+        <td>{v.Scope || '-'}</td>
+        <td style={{fontSize:12,fontFamily:'monospace',maxWidth:300,overflow:'hidden',textOverflow:'ellipsis'}}>{v.Mountpoint}</td>
+      </tr>)}</tbody>
+    </table>
+  </div>;
+}
+
+// Images
+function Images({ data }) {
+  const imgs = data?.images || [];
+  return <div className="card">
+    <table>
+      <thead><tr><th>Repositorio</th><th>Tag</th><th>ID</th><th>Size</th><th>Created</th></tr></thead>
+      <tbody>{imgs.map((img,i) => <tr key={i}>
+        <td><strong>{img.Repository}</strong></td>
+        <td><span className="badge badge-blue">{img.Tag}</span></td>
+        <td style={{fontFamily:'monospace',fontSize:12}}>{(img.ID||'').substring(0,19)}</td>
+        <td>{img.Size}</td>
+        <td style={{fontSize:12,color:'var(--muted)'}}>{img.CreatedSince || img.CreatedAt}</td>
+      </tr>)}</tbody>
+    </table>
+  </div>;
+}
+
+// Settings
+function Settings({ onSave, toast }) {
+  const [config, setConfig] = useState(null);
+  const [hosts, setHosts] = useState([]);
+  const [poll, setPoll] = useState(30);
+  const [testing, setTesting] = useState(null);
+  const [testResult, setTestResult] = useState(null);
+
+  useEffect(() => { api('config').then(d => { setConfig(d); setHosts(d.swarm_hosts||[]); setPoll(d.poll_interval||30); }); }, []);
+
+  const addHost = () => setHosts([...hosts, {name:'',host:'',user:'',password:''}]);
+  const removeHost = i => setHosts(hosts.filter((_,j)=>j!==i));
+  const updateHost = (i,field,val) => { const h=[...hosts]; h[i]={...h[i],[field]:val}; setHosts(h); };
+
+  const save = async () => {
+    const r = await api('config/save', {method:'POST', body:{swarm_hosts:hosts, poll_interval:poll}});
+    if (r.success) toast('Configuracion guardada','success');
+    else toast(r.error||'Error','error');
+  };
+
+  const testConn = async (i) => {
+    setTesting(i); setTestResult(null);
+    const h = hosts[i];
+    const pwd = h.password === '***' ? '' : h.password;
+    if (!pwd) { toast('Ingresa la password para probar','error'); setTesting(null); return; }
+    const r = await api('test-connection', {method:'POST', body:{host:h.host,user:h.user,password:pwd}});
+    setTestResult({index:i, ...r}); setTesting(null);
+  };
+
+  if (!config) return <div style={{textAlign:'center',padding:40}}><div className="spinner"/></div>;
+
+  return <div className="card">
+    <h3 style={{fontSize:15,fontWeight:600,marginBottom:16}}>Configuracion Docker Swarm</h3>
+
+    <div style={{marginBottom:16}}>
+      <label style={{fontSize:12,color:'var(--muted)',marginBottom:4,display:'block'}}>Intervalo de polling (segundos)</label>
+      <input type="number" value={poll} onChange={e=>setPoll(parseInt(e.target.value)||30)} min={10} max={300} style={{maxWidth:120}} />
+    </div>
+
+    <h4 style={{fontSize:13,color:'var(--muted)',marginBottom:8}}>Hosts Swarm (SSH)</h4>
+    {hosts.map((h,i) => <div key={i} style={{border:'1px solid var(--border)',borderRadius:8,padding:12,marginBottom:8}}>
+      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr 1fr',gap:8,marginBottom:8}}>
+        <div><label style={{fontSize:11,color:'var(--muted)'}}>Nombre</label><input value={h.name} onChange={e=>updateHost(i,'name',e.target.value)} placeholder="IASERVER01"/></div>
+        <div><label style={{fontSize:11,color:'var(--muted)'}}>Host/IP</label><input value={h.host} onChange={e=>updateHost(i,'host',e.target.value)} placeholder="190.160.10.129"/></div>
+        <div><label style={{fontSize:11,color:'var(--muted)'}}>Usuario</label><input value={h.user} onChange={e=>updateHost(i,'user',e.target.value)} placeholder="alfonso"/></div>
+        <div><label style={{fontSize:11,color:'var(--muted)'}}>Password</label><input type="password" value={h.password} onChange={e=>updateHost(i,'password',e.target.value)}/></div>
+      </div>
+      <div style={{display:'flex',gap:8}}>
+        <button className="btn btn-sm" onClick={()=>testConn(i)} disabled={testing===i}>
+          {testing===i ? <><span className="spinner" style={{width:14,height:14}}/> Probando...</> : 'Probar conexion'}
+        </button>
+        <button className="btn btn-sm btn-danger" onClick={()=>removeHost(i)}>Eliminar</button>
+        {testResult && testResult.index===i && <span style={{fontSize:12,color:testResult.success?'var(--green)':'var(--red)',alignSelf:'center'}}>
+          {testResult.success ? `OK - Swarm activo, ${testResult.nodes} nodos, ${testResult.managers} managers` : testResult.error}
+        </span>}
+      </div>
+    </div>)}
+
+    <div style={{display:'flex',gap:8,marginTop:12}}>
+      <button className="btn" onClick={addHost}>+ Agregar Host</button>
+      <button className="btn btn-primary" onClick={save}>Guardar Configuracion</button>
+    </div>
+  </div>;
+}
+
+// ============== APP ==============
+
+function App() {
+  const [tab, setTab] = useState('dashboard');
+  const [overview, setOverview] = useState(null);
+  const [nodeStats, setNodeStats] = useState(null);
+  const [nodes, setNodes] = useState(null);
+  const [services, setServices] = useState(null);
+  const [stacks, setStacks] = useState(null);
+  const [containers, setContainers] = useState(null);
+  const [networks, setNetworks] = useState(null);
+  const [volumes, setVolumes] = useState(null);
+  const [images, setImages] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [toastMsg, setToastMsg] = useState(null);
+  const [modal, setModal] = useState(null);
+  const [logs, setLogs] = useState('');
+  const [logsLoading, setLogsLoading] = useState(false);
+  const refreshRef = useRef(null);
+  const [countdown, setCountdown] = useState(15);
+  const countdownRef = useRef(null);
+  const REFRESH_INTERVAL = 15; // seconds
+
+  const toast = (msg, type='info') => setToastMsg({msg,type});
+
+  const loadTab = useCallback(async (t) => {
+    setLoading(true);
+    try {
+      switch(t) {
+        case 'dashboard':
+          const [ov, ns] = await Promise.all([api('overview'), api('node-stats')]);
+          setOverview(ov); setNodeStats(ns); break;
+        case 'nodes': setNodes(await api('nodes')); break;
+        case 'services': setServices(await api('services')); break;
+        case 'stacks': setStacks(await api('stacks')); break;
+        case 'containers': setContainers(await api('containers')); break;
+        case 'networks': setNetworks(await api('networks')); break;
+        case 'volumes': setVolumes(await api('volumes')); break;
+        case 'images': setImages(await api('images')); break;
+      }
+    } catch(e) { toast('Error cargando datos','error'); }
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { loadTab(tab); }, [tab]);
+
+  // Auto-refresh dashboard with visible countdown
+  useEffect(() => {
+    if (tab === 'dashboard') {
+      setCountdown(REFRESH_INTERVAL);
+      countdownRef.current = setInterval(() => {
+        setCountdown(prev => {
+          if (prev <= 1) {
+            loadTab('dashboard');
+            return REFRESH_INTERVAL;
+          }
+          return prev - 1;
+        });
+      }, 1000);
+    }
+    return () => { if (countdownRef.current) clearInterval(countdownRef.current); };
+  }, [tab]);
+
+  const showLogs = async (id, type='service') => {
+    setModal({type:'logs', title:`Logs: ${id}`}); setLogs(''); setLogsLoading(true);
+    const endpoint = type === 'container' ? 'container-logs' : 'service-logs';
+    const param = type === 'container' ? 'container_id' : 'service_id';
+    const r = await api(`${endpoint}?${param}=${encodeURIComponent(id)}&tail=200`);
+    setLogs(r.logs || r.error || 'Sin logs'); setLogsLoading(false);
+  };
+
+  const scaleService = (svc) => {
+    const current = (svc.Replicas||'').split('/').pop() || svc.replicas_spec || 1;
+    setModal({type:'scale', svc, current: parseInt(current)||1});
+  };
+
+  const doScale = async (svcName, replicas) => {
+    const r = await api('service-scale', {method:'POST', body:{service_id:svcName,replicas}});
+    if (r.success) { toast(`${svcName} escalado a ${replicas}`,'success'); setModal(null); loadTab('services'); }
+    else toast(r.error||'Error','error');
+  };
+
+  const doRestart = async (svcName) => {
+    if (!confirm(`Reiniciar servicio ${svcName}?`)) return;
+    const r = await api('service-restart', {method:'POST', body:{service_id:svcName}});
+    if (r.success) { toast(`${svcName} reiniciado`,'success'); loadTab('services'); }
+    else toast(r.error||'Error','error');
+  };
+
+  const showTasks = async (svc) => {
+    setModal({type:'tasks', title:`Tasks: ${svc.Name}`, tasks:null});
+    const r = await api(`tasks?service_id=${encodeURIComponent(svc.Name||svc.ID)}`);
+    setModal(m => ({...m, tasks: r.tasks||[]}));
+  };
+
+  const doContainerAction = async (id, action) => {
+    if (!confirm(`${action} container ${id}?`)) return;
+    const r = await api('container-action', {method:'POST', body:{container_id:id,action}});
+    if (r.success) { toast(`Container ${action}ed`,'success'); loadTab('containers'); }
+    else toast(r.error||'Error','error');
+  };
+
+  const doStackRemove = async (name) => {
+    if (!confirm(`ELIMINAR stack ${name}? Esto eliminara todos sus servicios.`)) return;
+    const r = await api('stack-remove', {method:'POST', body:{stack_name:name}});
+    if (r.success) { toast(`Stack ${name} eliminado`,'success'); loadTab('stacks'); }
+    else toast(r.error||'Error','error');
+  };
+
+  const tabs = [
+    {id:'dashboard', label:'Dashboard', icon:'#'},
+    {id:'nodes', label:'Nodos', icon:'N'},
+    {id:'services', label:'Servicios', icon:'S'},
+    {id:'stacks', label:'Stacks', icon:'K'},
+    {id:'containers', label:'Contenedores', icon:'C'},
+    {id:'networks', label:'Redes', icon:'R'},
+    {id:'volumes', label:'Volumenes', icon:'V'},
+    {id:'images', label:'Imagenes', icon:'I'},
+    {id:'settings', label:'Ajustes', icon:'*'},
+  ];
+
+  return <>
+    <div className="sidebar">
+      <div style={{padding:'0 20px 16px',borderBottom:'1px solid var(--border)',marginBottom:8}}>
+        <div style={{fontSize:16,fontWeight:700,color:'var(--accent)'}}>Docker Swarm</div>
+        <div style={{fontSize:11,color:'var(--muted)'}}>PegaProx Plugin</div>
+      </div>
+      {tabs.map(t => <div key={t.id} className={`sidebar-item ${tab===t.id?'active':''}`} onClick={()=>setTab(t.id)}>
+        <span style={{width:20,textAlign:'center',fontWeight:700,fontSize:14}}>{t.icon}</span> {t.label}
+      </div>)}
+      <div style={{position:'absolute',bottom:16,left:0,right:0,textAlign:'center',fontSize:11,color:'var(--muted)'}}>
+        <a href="/" style={{color:'var(--accent)',textDecoration:'none'}}>Volver a PegaProx</a>
+      </div>
+    </div>
+
+    <div className="main">
+      <div className="header" style={{position:'relative'}}>
+        <div style={{display:'flex',alignItems:'center',gap:12}}>
+          <h2 style={{fontSize:18,fontWeight:600}}>{tabs.find(t=>t.id===tab)?.label}</h2>
+          {tab==='dashboard' && <span style={{fontSize:11,color:'var(--muted)',display:'flex',alignItems:'center',gap:4}}><span className="live-dot" style={{width:6,height:6}}/> {countdown}s</span>}
+        </div>
+        <div style={{display:'flex',gap:8,alignItems:'center'}}>
+          {loading && <span className="spinner"/>}
+          <button className="btn" onClick={()=>{loadTab(tab);setCountdown(REFRESH_INTERVAL);}}>Refresh</button>
+        </div>
+        {tab==='dashboard' && <div className="countdown-bar" style={{width:`${(countdown/REFRESH_INTERVAL)*100}%`}}/>}
+      </div>
+
+      {tab==='dashboard' && <Dashboard overview={overview} nodeStats={nodeStats} loading={loading} />}
+      {tab==='nodes' && <Nodes data={nodes} />}
+      {tab==='services' && <Services data={services} onScale={scaleService} onRestart={doRestart} onLogs={id=>showLogs(id,'service')} onTasks={showTasks} />}
+      {tab==='stacks' && <Stacks data={stacks} onRemove={doStackRemove} />}
+      {tab==='containers' && <Containers data={containers} onLogs={id=>showLogs(id,'container')} onAction={doContainerAction} />}
+      {tab==='networks' && <Networks data={networks} />}
+      {tab==='volumes' && <Volumes data={volumes} />}
+      {tab==='images' && <Images data={images} />}
+      {tab==='settings' && <Settings onSave={()=>loadTab('dashboard')} toast={toast} />}
+    </div>
+
+    {/* Modals */}
+    {modal?.type==='logs' && <Modal title={modal.title} onClose={()=>setModal(null)}>
+      {logsLoading ? <div style={{textAlign:'center',padding:20}}><span className="spinner"/></div>
+        : <div className="log-viewer">{logs}</div>}
+    </Modal>}
+
+    {modal?.type==='scale' && <Modal title={`Escalar: ${modal.svc.Name}`} onClose={()=>setModal(null)}>
+      <div style={{marginBottom:12}}>
+        <label style={{fontSize:12,color:'var(--muted)'}}>Replicas actuales: {modal.current}</label>
+        <input type="number" id="scaleInput" defaultValue={modal.current} min={0} max={100} style={{marginTop:4}} />
+      </div>
+      <button className="btn btn-primary" onClick={()=>doScale(modal.svc.Name||modal.svc.ID, parseInt(document.getElementById('scaleInput').value))}>
+        Aplicar Scale
+      </button>
+    </Modal>}
+
+    {modal?.type==='tasks' && <Modal title={modal.title} onClose={()=>setModal(null)}>
+      {!modal.tasks ? <div style={{textAlign:'center',padding:20}}><span className="spinner"/></div>
+        : <table>
+          <thead><tr><th>ID</th><th>Nombre</th><th>Nodo</th><th>Estado</th><th>Error</th></tr></thead>
+          <tbody>{modal.tasks.map((t,i) => <tr key={i}>
+            <td style={{fontFamily:'monospace',fontSize:12}}>{(t.ID||'').substring(0,12)}</td>
+            <td>{t.Name}</td>
+            <td>{t.Node}</td>
+            <td><StatusBadge status={t.CurrentState?.split(' ')[0] || t.DesiredState} /><div style={{fontSize:11,color:'var(--muted)'}}>{t.CurrentState}</div></td>
+            <td style={{fontSize:12,color:'var(--red)',maxWidth:200,overflow:'hidden',textOverflow:'ellipsis'}}>{t.Error || '-'}</td>
+          </tr>)}</tbody>
+        </table>
+      }
+    </Modal>}
+
+    {toastMsg && <Toast msg={toastMsg.msg} type={toastMsg.type} onClose={()=>setToastMsg(null)} />}
+  </>;
+}
+
+ReactDOM.render(<App />, document.getElementById('root'));
+</script>
+</body>
+</html>
