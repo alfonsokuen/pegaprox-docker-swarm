@@ -279,28 +279,54 @@ def _fetch_services():
 
 
 def _fetch_stacks():
-    """Fetch stacks (docker stack ls)."""
-    stacks = _docker_json('docker stack ls --format "{{json .}}"')
-    if stacks is None:
-        # Fallback: derive stacks from service labels
-        services = _docker_json('docker service ls --format "{{json .}}"') or []
-        stack_map = {}
-        for svc in services:
-            inspect = _docker_json(
-                f'docker service inspect {svc.get("ID","")} --format "{{{{json .Spec.Labels}}}}"'
-            )
-            if inspect and isinstance(inspect, dict):
-                ns = inspect.get('com.docker.stack.namespace', '')
-            elif inspect and isinstance(inspect, list) and inspect:
-                ns = inspect[0].get('com.docker.stack.namespace', '') if isinstance(inspect[0], dict) else ''
-            else:
-                ns = ''
-            if ns:
-                if ns not in stack_map:
-                    stack_map[ns] = {'Name': ns, 'Services': 0}
-                stack_map[ns]['Services'] += 1
-        return list(stack_map.values())
-    return stacks or []
+    """Fetch stacks with health status from service replicas."""
+    # Get all services to derive stack info with replica status
+    services = _docker_json('docker service ls --format "{{json .}}"') or []
+
+    stack_map = {}
+    for svc in services:
+        # Get stack namespace from service name pattern or labels
+        svc_name = svc.get('Name', '')
+        replicas = svc.get('Replicas', '0/0')
+
+        # Parse replicas "3/3" → running=3, desired=3
+        parts = replicas.split('/')
+        running = int(parts[0]) if parts[0].isdigit() else 0
+        desired = int(parts[-1]) if parts[-1].isdigit() else 0
+
+        # Try to get stack from inspect labels (cached if possible)
+        inspect = _docker_json(f'docker service inspect {svc_name} --format "{{{{json .Spec.Labels}}}}"')
+        ns = ''
+        if inspect and isinstance(inspect, dict):
+            ns = inspect.get('com.docker.stack.namespace', '')
+        elif inspect and isinstance(inspect, list) and inspect:
+            ns = inspect[0].get('com.docker.stack.namespace', '') if isinstance(inspect[0], dict) else ''
+
+        if ns:
+            if ns not in stack_map:
+                stack_map[ns] = {
+                    'Name': ns, 'Services': 0,
+                    'running': 0, 'desired': 0, 'svc_running': 0, 'svc_total': 0
+                }
+            stack_map[ns]['Services'] += 1
+            stack_map[ns]['svc_total'] += 1
+            stack_map[ns]['running'] += running
+            stack_map[ns]['desired'] += desired
+            if running > 0:
+                stack_map[ns]['svc_running'] += 1
+
+    # Compute health status
+    for s in stack_map.values():
+        if s['desired'] == 0:
+            s['status'] = 'stopped'
+        elif s['running'] == s['desired']:
+            s['status'] = 'running'
+        elif s['running'] > 0:
+            s['status'] = 'partial'
+        else:
+            s['status'] = 'stopped'
+
+    return list(stack_map.values())
 
 
 def _fetch_containers():
