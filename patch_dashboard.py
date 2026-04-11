@@ -141,6 +141,25 @@ if idx >= 0:
     changes += 1
     print("Topology concat injected")
 
+# 8. Auto-refresh TopologyView when multiCluster grows (Swarm data arrives late)
+topo_autorefresh_marker = "// NS: view mode toggle - default to diagram, cards as fallback"
+topo_autorefresh = """// Auto-refresh topology when multiCluster grows (Swarm data arrives after render)
+            const prevMcLength = useRef(0);
+            useEffect(() => {
+                const curLen = multiCluster?.length || 0;
+                if (curLen > prevMcLength.current && prevMcLength.current > 0) {
+                    snapshotMultiCluster.current = multiCluster;
+                    setTopoRevision(r => r + 1);
+                }
+                prevMcLength.current = curLen;
+            }, [multiCluster?.length]);
+
+            """ + topo_autorefresh_marker
+if "prevMcLength" not in content:
+    content = content.replace(topo_autorefresh_marker, topo_autorefresh, 1)
+    changes += 1
+    print("Topology auto-refresh on growth injected")
+
 with open("/opt/PegaProx/web/src/dashboard.js", "w") as f:
     f.write(content)
 
