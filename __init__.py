@@ -449,6 +449,188 @@ def _api_images():
     return {'images': _fetch_images()}
 
 
+def _api_service_detail():
+    """GET — Full service inspect with all config sections. ?service_id=xxx"""
+    service_id = request.args.get('service_id', '')
+    if not service_id:
+        return {'error': 'service_id required'}, 400
+    if not all(c.isalnum() or c in '-_.' for c in service_id):
+        return {'error': 'Invalid service_id'}, 400
+
+    inspect = _docker_json(f'docker service inspect {service_id} --format "{{{{json .}}}}"')
+    if inspect and isinstance(inspect, list):
+        inspect = inspect[0]
+    if not inspect:
+        return {'error': f'Service {service_id} not found'}, 404
+
+    spec = inspect.get('Spec', {})
+    task_tmpl = spec.get('TaskTemplate', {})
+    container_spec = task_tmpl.get('ContainerSpec', {})
+    resources = task_tmpl.get('Resources', {})
+    placement = task_tmpl.get('Placement', {})
+    restart_policy = task_tmpl.get('RestartPolicy', {})
+    update_config = spec.get('UpdateConfig', {})
+    rollback_config = spec.get('RollbackConfig', {})
+    log_driver = task_tmpl.get('LogDriver', {})
+    endpoint_spec = spec.get('EndpointSpec', {})
+    endpoint = inspect.get('Endpoint', {})
+    mode = spec.get('Mode', {})
+    networks = task_tmpl.get('Networks', [])
+
+    # Get tasks
+    tasks = _docker_json(
+        f'docker service ps {service_id} --format "{{{{json .}}}}" --no-trunc 2>/dev/null'
+    ) or []
+
+    # Previous spec for rollback
+    prev_spec = inspect.get('PreviousSpec', {})
+
+    detail = {
+        'id': inspect.get('ID', ''),
+        'name': spec.get('Name', ''),
+        'created': inspect.get('CreatedAt', ''),
+        'updated': inspect.get('UpdatedAt', ''),
+        'version': inspect.get('Version', {}).get('Index', 0),
+        'update_status': inspect.get('UpdateStatus', {}),
+
+        # Scheduling
+        'mode_type': 'replicated' if 'Replicated' in mode else 'global' if 'Global' in mode else 'unknown',
+        'replicas': mode.get('Replicated', {}).get('Replicas', 0) if 'Replicated' in mode else None,
+
+        # Container spec
+        'image': container_spec.get('Image', ''),
+        'command': container_spec.get('Command', []),
+        'args': container_spec.get('Args', []),
+        'env': container_spec.get('Env', []),
+        'dir': container_spec.get('Dir', ''),
+        'user': container_spec.get('User', ''),
+        'hostname': container_spec.get('Hostname', ''),
+        'hosts': container_spec.get('Hosts', []),
+        'dns': container_spec.get('DNSConfig', {}),
+        'stop_grace_period': container_spec.get('StopGracePeriod', 0),
+        'healthcheck': container_spec.get('Healthcheck', {}),
+        'read_only': container_spec.get('ReadOnly', False),
+        'init': container_spec.get('Init', None),
+
+        # Labels
+        'service_labels': spec.get('Labels', {}),
+        'container_labels': container_spec.get('Labels', {}),
+
+        # Mounts
+        'mounts': container_spec.get('Mounts', []),
+
+        # Networks & Ports
+        'networks': networks,
+        'endpoint_mode': endpoint_spec.get('Mode', 'vip'),
+        'ports': endpoint_spec.get('Ports', []),
+        'published_ports': endpoint.get('Ports', []),
+        'virtual_ips': endpoint.get('VirtualIPs', []),
+
+        # Resources
+        'resource_limits': resources.get('Limits', {}),
+        'resource_reservations': resources.get('Reservations', {}),
+
+        # Placement
+        'constraints': placement.get('Constraints', []),
+        'preferences': placement.get('Preferences', []),
+        'platforms': placement.get('Platforms', []),
+        'max_replicas': placement.get('MaxReplicas', 0),
+
+        # Restart policy
+        'restart_condition': restart_policy.get('Condition', 'any'),
+        'restart_delay': restart_policy.get('Delay', 0),
+        'restart_max_attempts': restart_policy.get('MaxAttempts', 0),
+        'restart_window': restart_policy.get('Window', 0),
+
+        # Update config
+        'update_parallelism': update_config.get('Parallelism', 1),
+        'update_delay': update_config.get('Delay', 0),
+        'update_failure_action': update_config.get('FailureAction', 'pause'),
+        'update_monitor': update_config.get('Monitor', 0),
+        'update_max_failure_ratio': update_config.get('MaxFailureRatio', 0),
+        'update_order': update_config.get('Order', 'stop-first'),
+
+        # Rollback config
+        'rollback_parallelism': rollback_config.get('Parallelism', 1),
+        'rollback_delay': rollback_config.get('Delay', 0),
+        'rollback_failure_action': rollback_config.get('FailureAction', 'pause'),
+        'rollback_order': rollback_config.get('Order', 'stop-first'),
+
+        # Logging
+        'log_driver': log_driver.get('Name', ''),
+        'log_options': log_driver.get('Options', {}),
+
+        # Configs & Secrets
+        'configs': container_spec.get('Configs', []),
+        'secrets': container_spec.get('Secrets', []),
+
+        # Tasks
+        'tasks': tasks,
+
+        # Rollback available?
+        'has_previous_spec': bool(prev_spec),
+        'previous_image': prev_spec.get('TaskTemplate', {}).get('ContainerSpec', {}).get('Image', '') if prev_spec else '',
+    }
+
+    return detail
+
+
+def _api_service_rollback():
+    """POST — Rollback a service. Body: {service_id}"""
+    data = request.get_json() or {}
+    service_id = data.get('service_id', '')
+    if not service_id:
+        return {'error': 'service_id required'}, 400
+    if not all(c.isalnum() or c in '-_.' for c in service_id):
+        return {'error': 'Invalid service_id'}, 400
+
+    result = _docker_cmd(f'docker service rollback {service_id}')
+    if result is not None:
+        log_audit(_get_username(), 'docker.service_rollback', f'Rolled back service {service_id}')
+        with _cache_lock:
+            _cache.pop('services', None)
+        return {'success': True, 'message': f'Service {service_id} rolled back'}
+    return {'error': 'Rollback failed'}, 500
+
+
+def _api_service_update():
+    """POST — Update service config. Body: {service_id, image, replicas, env, ...}"""
+    data = request.get_json() or {}
+    service_id = data.get('service_id', '')
+    if not service_id or not all(c.isalnum() or c in '-_.' for c in service_id):
+        return {'error': 'Valid service_id required'}, 400
+
+    cmd_parts = [f'docker service update']
+
+    if 'image' in data and data['image']:
+        cmd_parts.append(f'--image {data["image"]}')
+    if 'replicas' in data and data['replicas'] is not None:
+        cmd_parts.append(f'--replicas {int(data["replicas"])}')
+    if 'force' in data and data['force']:
+        cmd_parts.append('--force')
+    if 'env_add' in data:
+        for e in data['env_add']:
+            cmd_parts.append(f'--env-add "{e}"')
+    if 'env_rm' in data:
+        for e in data['env_rm']:
+            cmd_parts.append(f'--env-rm "{e}"')
+    if 'limit_cpu' in data:
+        cmd_parts.append(f'--limit-cpu {data["limit_cpu"]}')
+    if 'limit_memory' in data:
+        cmd_parts.append(f'--limit-memory {data["limit_memory"]}')
+
+    cmd_parts.append(service_id)
+    cmd = ' '.join(cmd_parts)
+
+    result = _docker_cmd(cmd)
+    if result is not None:
+        log_audit(_get_username(), 'docker.service_updated', f'Updated service {service_id}')
+        with _cache_lock:
+            _cache.pop('services', None)
+        return {'success': True, 'message': result or f'Service {service_id} updated'}
+    return {'error': 'Update failed'}, 500
+
+
 def _api_tasks():
     """GET — Tasks for a service. ?service_id=xxx"""
     service_id = request.args.get('service_id', '')
@@ -1105,9 +1287,12 @@ def register(app):
         'volumes': _api_volumes,
         'images': _api_images,
         'tasks': _api_tasks,
+        'service-detail': _api_service_detail,
         'service-logs': _api_service_logs,
         'service-scale': _api_service_scale,
         'service-restart': _api_service_restart,
+        'service-rollback': _api_service_rollback,
+        'service-update': _api_service_update,
         'service-remove': _api_service_remove,
         'container-logs': _api_container_logs,
         'container-action': _api_container_action,

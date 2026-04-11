@@ -232,9 +232,293 @@ function Nodes({ data }) {
   </div>;
 }
 
+// Service Detail — Portainer-style full service view
+function ServiceDetail({ serviceId, onBack, toast }) {
+  const [svc, setSvc] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [section, setSection] = useState('details');
+  const [logs, setLogs] = useState('');
+  const [logsLoading, setLogsLoading] = useState(false);
+  const [editReplicas, setEditReplicas] = useState('');
+  const [editImage, setEditImage] = useState('');
+
+  const load = async () => {
+    setLoading(true);
+    const d = await api(`service-detail?service_id=${encodeURIComponent(serviceId)}`);
+    setSvc(d); setEditReplicas(d.replicas ?? ''); setEditImage(d.image?.split('@')[0] || '');
+    setLoading(false);
+  };
+  useEffect(() => { load(); }, [serviceId]);
+
+  const loadLogs = async () => { setLogsLoading(true); const r = await api(`service-logs?service_id=${encodeURIComponent(serviceId)}&tail=200`); setLogs(r.logs||''); setLogsLoading(false); };
+
+  const doUpdate = async () => {
+    const body = { service_id: serviceId };
+    if (editImage !== (svc.image?.split('@')[0]||'')) body.image = editImage;
+    if (svc.mode_type === 'replicated' && parseInt(editReplicas) !== svc.replicas) body.replicas = parseInt(editReplicas);
+    const r = await api('service-update', {method:'POST', body});
+    if (r.success) { toast('Servicio actualizado','success'); load(); } else toast(r.error,'error');
+  };
+  const doRollback = async () => { if(!confirm('Rollback este servicio a la version anterior?'))return; const r=await api('service-rollback',{method:'POST',body:{service_id:serviceId}}); if(r.success){toast('Rollback exitoso','success');load();}else toast(r.error,'error'); };
+  const doRestart = async () => { const r=await api('service-restart',{method:'POST',body:{service_id:serviceId}}); if(r.success){toast('Reiniciado','success');load();}else toast(r.error,'error'); };
+  const doRemove = async () => { if(!confirm(`ELIMINAR servicio ${serviceId}?`))return; const r=await api('service-remove',{method:'POST',body:{service_id:serviceId}}); if(r.success){toast('Eliminado','success');onBack();}else toast(r.error,'error'); };
+
+  const fmtNano = (ns) => ns ? `${(ns/1e9).toFixed(1)}s` : '-';
+  const fmtNanoCpu = (n) => n ? (n/1e9).toFixed(2) : '-';
+  const fmtMemLimit = (b) => b ? fmtBytes(b) : '-';
+
+  if (loading) return <div style={{textAlign:'center',padding:40}}><span className="spinner"/> Cargando servicio...</div>;
+  if (!svc || svc.error) return <div className="card" style={{padding:20,color:'var(--red)'}}>{svc?.error||'Error'}</div>;
+
+  const sections = [
+    {id:'details',label:'Detalles'},
+    {id:'env',label:'Variables de Entorno'},
+    {id:'image',label:'Container Image'},
+    {id:'labels',label:'Labels'},
+    {id:'mounts',label:'Mounts'},
+    {id:'network',label:'Network & Puertos'},
+    {id:'resources',label:'Recursos'},
+    {id:'placement',label:'Placement'},
+    {id:'restart',label:'Restart Policy'},
+    {id:'update',label:'Update Config'},
+    {id:'logging',label:'Logging'},
+    {id:'secrets',label:'Configs & Secrets'},
+    {id:'tasks',label:'Tasks'},
+    {id:'logs',label:'Logs'},
+  ];
+
+  const Row = ({label, val, mono}) => <tr><td style={{color:'var(--muted)',width:200,fontSize:13}}>{label}</td><td style={mono?{fontFamily:'monospace',fontSize:12}:{fontSize:13}}>{val||'-'}</td></tr>;
+
+  return <>
+    <div style={{display:'flex',alignItems:'center',gap:12,marginBottom:16}}>
+      <button className="btn btn-sm" onClick={onBack}>← Volver</button>
+      <h3 style={{fontSize:16,fontWeight:700}}>Service details</h3>
+      <span style={{fontSize:12,color:'var(--muted)',fontFamily:'monospace'}}>{svc.name}</span>
+    </div>
+
+    <div style={{display:'flex',gap:16}}>
+      {/* Main content */}
+      <div style={{flex:1}}>
+        {section==='details' && <div className="card fade-in">
+          <h4 style={{fontSize:14,fontWeight:600,marginBottom:12,display:'flex',alignItems:'center',gap:8}}>Service details</h4>
+          <table style={{width:'100%'}}><tbody>
+            <Row label="Name" val={svc.name} />
+            <Row label="ID" val={svc.id} mono />
+            <Row label="Created at" val={svc.created ? new Date(svc.created).toLocaleString() : '-'} />
+            <Row label="Last updated at" val={svc.updated ? new Date(svc.updated).toLocaleString() : '-'} />
+            <Row label="Version" val={svc.version} />
+            <Row label="Scheduling mode" val={svc.mode_type} />
+          </tbody></table>
+
+          <div style={{marginTop:16,display:'flex',gap:12,alignItems:'flex-end'}}>
+            {svc.mode_type==='replicated' && <div>
+              <label style={{fontSize:12,color:'var(--muted)',display:'block',marginBottom:4}}>Replicas</label>
+              <input type="number" value={editReplicas} onChange={e=>setEditReplicas(e.target.value)} min={0} max={100} style={{width:80}} />
+            </div>}
+            <div style={{flex:1}}>
+              <label style={{fontSize:12,color:'var(--muted)',display:'block',marginBottom:4}}>Image</label>
+              <input value={editImage} onChange={e=>setEditImage(e.target.value)} style={{fontFamily:'monospace',fontSize:12}} />
+            </div>
+          </div>
+
+          <div style={{fontSize:11,color:'var(--muted)',marginTop:4}}>Full: {svc.image}</div>
+
+          {svc.has_previous_spec && <div style={{marginTop:12,padding:8,background:'rgba(234,179,8,.1)',borderRadius:6,fontSize:12,color:'var(--yellow)'}}>
+            Rollback disponible. Imagen anterior: {svc.previous_image?.split('@')[0] || 'unknown'}
+          </div>}
+
+          <div style={{marginTop:16,display:'flex',gap:8,flexWrap:'wrap',borderTop:'1px solid var(--border)',paddingTop:12}}>
+            <button className="btn btn-sm" onClick={()=>{setSection('logs');loadLogs();}}>Service logs</button>
+            <button className="btn btn-sm btn-primary" onClick={doUpdate}>Update the service</button>
+            {svc.has_previous_spec && <button className="btn btn-sm" style={{background:'var(--yellow)',borderColor:'var(--yellow)',color:'#000'}} onClick={doRollback}>Rollback the service</button>}
+            <button className="btn btn-sm btn-danger" onClick={doRemove}>Delete the service</button>
+          </div>
+        </div>}
+
+        {section==='env' && <div className="card fade-in">
+          <h4 style={{fontSize:14,fontWeight:600,marginBottom:12}}>Environment variables ({svc.env?.length||0})</h4>
+          {(svc.env||[]).length ? <div style={{background:'var(--bg)',borderRadius:6,padding:8,fontFamily:'monospace',fontSize:12,maxHeight:400,overflow:'auto'}}>
+            {svc.env.map((e,i)=>{const [k,...v]=e.split('=');const val=v.join('=');const sensitive=/password|secret|key|token|api_key/i.test(k);
+              return <div key={i} style={{padding:'3px 0',borderBottom:'1px solid var(--border)'}}><span style={{color:'var(--blue)'}}>{k}</span>=<span style={{color:sensitive?'var(--red)':'var(--green)'}}>{sensitive?'••••••••':val}</span></div>;})}
+          </div> : <div style={{color:'var(--muted)'}}>No hay variables de entorno</div>}
+        </div>}
+
+        {section==='image' && <div className="card fade-in">
+          <h4 style={{fontSize:14,fontWeight:600,marginBottom:12}}>Container image</h4>
+          <table style={{width:'100%'}}><tbody>
+            <Row label="Image" val={svc.image?.split('@')[0]} mono />
+            <Row label="Digest" val={svc.image?.includes('@') ? svc.image.split('@')[1] : '-'} mono />
+            <Row label="Command" val={(svc.command||[]).join(' ')} mono />
+            <Row label="Arguments" val={(svc.args||[]).join(' ')} mono />
+            <Row label="Working Dir" val={svc.dir} mono />
+            <Row label="User" val={svc.user} />
+            <Row label="Hostname" val={svc.hostname} />
+            <Row label="Read Only" val={svc.read_only?'Yes':'No'} />
+            <Row label="Init" val={svc.init===true?'Yes':svc.init===false?'No':'-'} />
+            <Row label="Stop Grace Period" val={fmtNano(svc.stop_grace_period)} />
+          </tbody></table>
+          {svc.healthcheck && Object.keys(svc.healthcheck).length>0 && <>
+            <h5 style={{fontSize:13,color:'var(--muted)',marginTop:12}}>Healthcheck</h5>
+            <table style={{width:'100%'}}><tbody>
+              <Row label="Test" val={(svc.healthcheck.Test||[]).join(' ')} mono />
+              <Row label="Interval" val={fmtNano(svc.healthcheck.Interval)} />
+              <Row label="Timeout" val={fmtNano(svc.healthcheck.Timeout)} />
+              <Row label="Retries" val={svc.healthcheck.Retries} />
+            </tbody></table>
+          </>}
+        </div>}
+
+        {section==='labels' && <div className="card fade-in">
+          <h4 style={{fontSize:14,fontWeight:600,marginBottom:12}}>Service labels</h4>
+          {Object.entries(svc.service_labels||{}).length ? <div style={{background:'var(--bg)',borderRadius:6,padding:8,fontFamily:'monospace',fontSize:12}}>
+            {Object.entries(svc.service_labels).map(([k,v],i)=><div key={i} style={{padding:'3px 0',borderBottom:'1px solid var(--border)'}}><span style={{color:'var(--blue)'}}>{k}</span>=<span style={{color:'var(--green)'}}>{v}</span></div>)}
+          </div> : <div style={{color:'var(--muted)'}}>No hay labels</div>}
+          <h4 style={{fontSize:14,fontWeight:600,marginTop:16,marginBottom:12}}>Container labels</h4>
+          {Object.entries(svc.container_labels||{}).length ? <div style={{background:'var(--bg)',borderRadius:6,padding:8,fontFamily:'monospace',fontSize:12}}>
+            {Object.entries(svc.container_labels).map(([k,v],i)=><div key={i} style={{padding:'3px 0',borderBottom:'1px solid var(--border)'}}><span style={{color:'var(--blue)'}}>{k}</span>=<span style={{color:'var(--green)'}}>{v}</span></div>)}
+          </div> : <div style={{color:'var(--muted)'}}>No hay container labels</div>}
+        </div>}
+
+        {section==='mounts' && <div className="card fade-in">
+          <h4 style={{fontSize:14,fontWeight:600,marginBottom:12}}>Mounts ({(svc.mounts||[]).length})</h4>
+          {(svc.mounts||[]).length ? <table><thead><tr><th>Tipo</th><th>Source</th><th>Target</th><th>ReadOnly</th></tr></thead>
+            <tbody>{svc.mounts.map((m,i)=><tr key={i}><td><span className="badge badge-blue">{m.Type}</span></td><td style={{fontFamily:'monospace',fontSize:12}}>{m.Source||'-'}</td><td style={{fontFamily:'monospace',fontSize:12}}>{m.Target}</td><td>{m.ReadOnly?'Yes':'No'}</td></tr>)}</tbody>
+          </table> : <div style={{color:'var(--muted)'}}>No hay mounts</div>}
+        </div>}
+
+        {section==='network' && <div className="card fade-in">
+          <h4 style={{fontSize:14,fontWeight:600,marginBottom:12}}>Network & published ports</h4>
+          <table style={{width:'100%'}}><tbody>
+            <Row label="Endpoint Mode" val={svc.endpoint_mode} />
+          </tbody></table>
+          {(svc.published_ports||[]).length>0 && <>
+            <h5 style={{fontSize:13,color:'var(--muted)',marginTop:12}}>Published ports</h5>
+            <table><thead><tr><th>Published</th><th>Target</th><th>Protocol</th><th>Mode</th></tr></thead>
+              <tbody>{svc.published_ports.map((p,i)=><tr key={i}><td>{p.PublishedPort}</td><td>{p.TargetPort}</td><td>{p.Protocol}</td><td>{p.PublishMode||'ingress'}</td></tr>)}</tbody>
+            </table>
+          </>}
+          {(svc.virtual_ips||[]).length>0 && <>
+            <h5 style={{fontSize:13,color:'var(--muted)',marginTop:12}}>Virtual IPs</h5>
+            {svc.virtual_ips.map((v,i)=><div key={i} style={{fontFamily:'monospace',fontSize:12}}>{v.Addr} (Network: {(v.NetworkID||'').substring(0,12)})</div>)}
+          </>}
+        </div>}
+
+        {section==='resources' && <div className="card fade-in">
+          <h4 style={{fontSize:14,fontWeight:600,marginBottom:12}}>Resource limits & reservations</h4>
+          <table style={{width:'100%'}}><tbody>
+            <Row label="CPU Limit" val={fmtNanoCpu(svc.resource_limits?.NanoCPUs)} />
+            <Row label="Memory Limit" val={fmtMemLimit(svc.resource_limits?.MemoryBytes)} />
+            <Row label="CPU Reservation" val={fmtNanoCpu(svc.resource_reservations?.NanoCPUs)} />
+            <Row label="Memory Reservation" val={fmtMemLimit(svc.resource_reservations?.MemoryBytes)} />
+          </tbody></table>
+        </div>}
+
+        {section==='placement' && <div className="card fade-in">
+          <h4 style={{fontSize:14,fontWeight:600,marginBottom:12}}>Placement constraints</h4>
+          {(svc.constraints||[]).length ? <div style={{background:'var(--bg)',borderRadius:6,padding:8,fontFamily:'monospace',fontSize:12}}>
+            {svc.constraints.map((c,i)=><div key={i} style={{padding:'2px 0'}}>{c}</div>)}
+          </div> : <div style={{color:'var(--muted)'}}>No hay constraints</div>}
+          <h4 style={{fontSize:14,fontWeight:600,marginTop:16,marginBottom:12}}>Placement preferences</h4>
+          {(svc.preferences||[]).length ? <div style={{background:'var(--bg)',borderRadius:6,padding:8,fontFamily:'monospace',fontSize:12}}>
+            {svc.preferences.map((p,i)=><div key={i}>{JSON.stringify(p)}</div>)}
+          </div> : <div style={{color:'var(--muted)'}}>No hay preferences</div>}
+          {svc.max_replicas>0 && <div style={{marginTop:8}}><Row label="Max replicas per node" val={svc.max_replicas}/></div>}
+        </div>}
+
+        {section==='restart' && <div className="card fade-in">
+          <h4 style={{fontSize:14,fontWeight:600,marginBottom:12}}>Restart policy</h4>
+          <table style={{width:'100%'}}><tbody>
+            <Row label="Condition" val={svc.restart_condition} />
+            <Row label="Delay" val={fmtNano(svc.restart_delay)} />
+            <Row label="Max Attempts" val={svc.restart_max_attempts||'unlimited'} />
+            <Row label="Window" val={fmtNano(svc.restart_window)} />
+          </tbody></table>
+        </div>}
+
+        {section==='update' && <div className="card fade-in">
+          <h4 style={{fontSize:14,fontWeight:600,marginBottom:12}}>Update configuration</h4>
+          <table style={{width:'100%'}}><tbody>
+            <Row label="Parallelism" val={svc.update_parallelism} />
+            <Row label="Delay" val={fmtNano(svc.update_delay)} />
+            <Row label="Failure Action" val={svc.update_failure_action} />
+            <Row label="Monitor" val={fmtNano(svc.update_monitor)} />
+            <Row label="Max Failure Ratio" val={svc.update_max_failure_ratio} />
+            <Row label="Order" val={svc.update_order} />
+          </tbody></table>
+          <h4 style={{fontSize:14,fontWeight:600,marginTop:16,marginBottom:12}}>Rollback configuration</h4>
+          <table style={{width:'100%'}}><tbody>
+            <Row label="Parallelism" val={svc.rollback_parallelism} />
+            <Row label="Delay" val={fmtNano(svc.rollback_delay)} />
+            <Row label="Failure Action" val={svc.rollback_failure_action} />
+            <Row label="Order" val={svc.rollback_order} />
+          </tbody></table>
+        </div>}
+
+        {section==='logging' && <div className="card fade-in">
+          <h4 style={{fontSize:14,fontWeight:600,marginBottom:12}}>Logging</h4>
+          <table style={{width:'100%'}}><tbody>
+            <Row label="Driver" val={svc.log_driver||'default (json-file)'} />
+          </tbody></table>
+          {Object.keys(svc.log_options||{}).length>0 && <div style={{marginTop:8,background:'var(--bg)',borderRadius:6,padding:8,fontFamily:'monospace',fontSize:12}}>
+            {Object.entries(svc.log_options).map(([k,v],i)=><div key={i}><span style={{color:'var(--blue)'}}>{k}</span>={v}</div>)}
+          </div>}
+        </div>}
+
+        {section==='secrets' && <div className="card fade-in">
+          <h4 style={{fontSize:14,fontWeight:600,marginBottom:12}}>Configs ({(svc.configs||[]).length})</h4>
+          {(svc.configs||[]).length ? <table><thead><tr><th>Name</th><th>Target</th><th>Mode</th></tr></thead>
+            <tbody>{svc.configs.map((c,i)=><tr key={i}><td>{c.ConfigName||c.ConfigID}</td><td style={{fontFamily:'monospace',fontSize:12}}>{c.File?.Name}</td><td>{c.File?.Mode}</td></tr>)}</tbody>
+          </table> : <div style={{color:'var(--muted)'}}>No hay configs</div>}
+          <h4 style={{fontSize:14,fontWeight:600,marginTop:16,marginBottom:12}}>Secrets ({(svc.secrets||[]).length})</h4>
+          {(svc.secrets||[]).length ? <table><thead><tr><th>Name</th><th>Target</th><th>Mode</th></tr></thead>
+            <tbody>{svc.secrets.map((s,i)=><tr key={i}><td>{s.SecretName||s.SecretID}</td><td style={{fontFamily:'monospace',fontSize:12}}>{s.File?.Name}</td><td>{s.File?.Mode}</td></tr>)}</tbody>
+          </table> : <div style={{color:'var(--muted)'}}>No hay secrets</div>}
+        </div>}
+
+        {section==='tasks' && <div className="card fade-in">
+          <h4 style={{fontSize:14,fontWeight:600,marginBottom:12}}>Tasks ({(svc.tasks||[]).length})</h4>
+          <table><thead><tr><th>ID</th><th>Nombre</th><th>Nodo</th><th>Estado</th><th>Error</th></tr></thead>
+            <tbody>{(svc.tasks||[]).map((t,i)=><tr key={i}>
+              <td style={{fontFamily:'monospace',fontSize:12}}>{(t.ID||'').substring(0,12)}</td>
+              <td>{t.Name}</td><td>{t.Node}</td>
+              <td><StatusBadge status={t.CurrentState?.split(' ')[0]||t.DesiredState}/><div style={{fontSize:11,color:'var(--muted)'}}>{t.CurrentState}</div></td>
+              <td style={{fontSize:12,color:'var(--red)',maxWidth:250,overflow:'hidden',textOverflow:'ellipsis'}}>{t.Error||'-'}</td>
+            </tr>)}</tbody>
+          </table>
+        </div>}
+
+        {section==='logs' && <div className="card fade-in">
+          <div style={{display:'flex',justifyContent:'space-between',marginBottom:8}}>
+            <h4 style={{fontSize:14,fontWeight:600}}>Service logs</h4>
+            <button className="btn btn-sm" onClick={loadLogs}>Actualizar</button>
+          </div>
+          {logsLoading ? <div style={{textAlign:'center',padding:20}}><span className="spinner"/></div>
+            : <div className="log-viewer">{logs||'Sin logs'}</div>}
+        </div>}
+      </div>
+
+      {/* Quick navigation sidebar */}
+      <div style={{width:200,flexShrink:0}}>
+        <div className="card" style={{position:'sticky',top:0}}>
+          <h4 style={{fontSize:13,fontWeight:600,marginBottom:8}}>Quick navigation</h4>
+          {sections.map(s=><div key={s.id} style={{padding:'5px 8px',fontSize:12,cursor:'pointer',borderRadius:4,color:section===s.id?'var(--accent)':'var(--muted)',background:section===s.id?'rgba(229,112,0,.1)':'transparent',marginBottom:2,transition:'all .15s'}}
+            onClick={()=>{setSection(s.id);if(s.id==='logs'&&!logs)loadLogs();}}
+            onMouseEnter={e=>{if(section!==s.id)e.currentTarget.style.color='var(--text)';}}
+            onMouseLeave={e=>{if(section!==s.id)e.currentTarget.style.color='var(--muted)';}}
+          >{s.label}</div>)}
+        </div>
+      </div>
+    </div>
+  </>;
+}
+
 // Services
-function Services({ data, onScale, onRestart, onLogs, onTasks }) {
+function Services({ data, onScale, onRestart, onLogs, onTasks, toast }) {
+  const [selectedService, setSelectedService] = useState(null);
   const [filter, setFilter] = useState('');
+
+  if (selectedService) return <ServiceDetail serviceId={selectedService} onBack={()=>setSelectedService(null)} toast={toast} />;
+
   if (!data || !data.length) return <div className="card" style={{padding:20,color:'var(--muted)'}}>Sin servicios</div>;
 
   const filtered = data.filter(s => {
@@ -255,7 +539,7 @@ function Services({ data, onScale, onRestart, onLogs, onTasks }) {
           const img = (s.Image || s.image_full || '').split('@')[0];
           const shortImg = img.includes('/') ? img.split('/').pop() : img;
           return <tr key={i}>
-            <td><strong>{s.Name}</strong><div style={{fontSize:11,color:'var(--muted)',fontFamily:'monospace'}}>{(s.ID||'').substring(0,12)}</div></td>
+            <td><strong style={{cursor:'pointer',color:'var(--accent)'}} onClick={()=>setSelectedService(s.Name)}>{s.Name}</strong><div style={{fontSize:11,color:'var(--muted)',fontFamily:'monospace'}}>{(s.ID||'').substring(0,12)}</div></td>
             <td>{s.stack ? <span className="badge badge-blue">{s.stack}</span> : '-'}</td>
             <td style={{fontSize:12,maxWidth:200,overflow:'hidden',textOverflow:'ellipsis'}} title={img}>{shortImg}</td>
             <td><span style={{fontWeight:600}}>{s.Replicas}</span>{s.mode_type === 'global' && <span className="badge badge-muted" style={{marginLeft:4}}>global</span>}</td>
@@ -787,7 +1071,7 @@ function App() {
 
       {tab==='dashboard' && <Dashboard overview={overview} nodeStats={nodeStats} loading={loading} />}
       {tab==='nodes' && <Nodes data={nodes} />}
-      {tab==='services' && <Services data={services} onScale={scaleService} onRestart={doRestart} onLogs={id=>showLogs(id,'service')} onTasks={showTasks} />}
+      {tab==='services' && <Services data={services} onScale={scaleService} onRestart={doRestart} onLogs={id=>showLogs(id,'service')} onTasks={showTasks} toast={toast} />}
       {tab==='stacks' && <Stacks data={stacks} onRemove={doStackRemove} toast={toast} />}
       {tab==='containers' && <Containers data={containers} onLogs={id=>showLogs(id,'container')} onAction={doContainerAction} />}
       {tab==='networks' && <Networks data={networks} />}
