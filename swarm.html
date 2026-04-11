@@ -1330,6 +1330,129 @@ function Settings({ onSave, toast }) {
   </div>;
 }
 
+// ============== LOAD BALANCE ==============
+
+function NodeBalanceCard({ node: n, maxTasks, rebalancing, onRebalance }) {
+  const [expanded, setExpanded] = useState(false);
+  const cpuColor = n.cpu_percent > 80 ? 'var(--red)' : n.cpu_percent > 50 ? 'var(--yellow)' : 'var(--green)';
+  const memColor = n.mem_percent > 80 ? 'var(--red)' : n.mem_percent > 50 ? 'var(--yellow)' : 'var(--green)';
+  const taskBarPct = (n.tasks_running / maxTasks) * 100;
+
+  return <div className="card" style={{padding:16}}>
+    <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:12}}>
+      <div>
+        <div style={{fontSize:15,fontWeight:700}}>{n.name}</div>
+        <div style={{fontSize:11,color:'var(--muted)',fontFamily:'monospace'}}>{n.host} {n.node_id && `(${n.node_id})`}</div>
+      </div>
+      <div style={{fontSize:28,fontWeight:800,color:'var(--text)'}}>{n.tasks_running}</div>
+    </div>
+
+    {/* Tasks bar */}
+    <div style={{marginBottom:12}}>
+      <div style={{display:'flex',justifyContent:'space-between',fontSize:11,color:'var(--muted)',marginBottom:4}}>
+        <span>Tasks</span><span>{n.tasks_running} / {maxTasks}</span>
+      </div>
+      <ProgressBar percent={taskBarPct} color="#3b82f6" />
+    </div>
+
+    {/* CPU */}
+    <div style={{marginBottom:8}}>
+      <div style={{display:'flex',justifyContent:'space-between',fontSize:11,color:'var(--muted)',marginBottom:4}}>
+        <span>CPU ({n.cpu_count} cores)</span><span style={{color:cpuColor,fontWeight:600}}>{n.cpu_percent}%</span>
+      </div>
+      <ProgressBar percent={n.cpu_percent} color={cpuColor} />
+    </div>
+
+    {/* RAM */}
+    <div style={{marginBottom:12}}>
+      <div style={{display:'flex',justifyContent:'space-between',fontSize:11,color:'var(--muted)',marginBottom:4}}>
+        <span>RAM</span><span style={{color:memColor,fontWeight:600}}>{n.mem_total ? `${fmtBytes(n.mem_used)} / ${fmtBytes(n.mem_total)}` : '-'} ({n.mem_percent}%)</span>
+      </div>
+      <ProgressBar percent={n.mem_percent} color={memColor} />
+    </div>
+
+    {/* Services list (collapsible) */}
+    {n.services && n.services.length > 0 && <>
+      <div onClick={()=>setExpanded(!expanded)} style={{cursor:'pointer',fontSize:12,color:'var(--accent)',display:'flex',alignItems:'center',gap:4,marginBottom:expanded?8:0}}>
+        <span style={{transform:expanded?'rotate(90deg)':'none',transition:'transform .2s',display:'inline-block'}}>&#9654;</span>
+        {n.services.length} servicios
+      </div>
+      {expanded && <div style={{maxHeight:200,overflow:'auto'}}>
+        {n.services.map((svc,si) => <div key={si} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'4px 0',borderBottom:'1px solid var(--border)',fontSize:12}}>
+          <span style={{fontFamily:'monospace'}}>{svc}</span>
+          <button className="btn btn-sm" style={{fontSize:10,padding:'2px 8px'}}
+            disabled={rebalancing===svc} onClick={()=>onRebalance(svc)}>
+            {rebalancing===svc ? '...' : 'Rebalancear'}
+          </button>
+        </div>)}
+      </div>}
+    </>}
+  </div>;
+}
+
+function LoadBalance({ data, toast }) {
+  const [rebalancing, setRebalancing] = useState(null);
+
+  if (!data) return <div className="card" style={{padding:20,color:'var(--muted)'}}>Sin datos de balance</div>;
+  if (data.error) return <div className="card" style={{padding:20,color:'var(--red)'}}>{data.error}</div>;
+
+  const { nodes, total_tasks, balance_score, recommendation } = data;
+  const scoreColor = balance_score >= 80 ? 'var(--green)' : balance_score >= 50 ? 'var(--yellow)' : 'var(--red)';
+  const maxTasks = Math.max(...nodes.map(n => n.tasks_running), 1);
+
+  const doRebalance = async (svcName) => {
+    if (!confirm(`Rebalancear ${svcName}? Esto forzara un re-deploy del servicio.`)) return;
+    setRebalancing(svcName);
+    try {
+      const r = await api('rebalance-service', {method:'POST', body:{service_name: svcName}});
+      if (r.success) toast(`${svcName} rebalanceando...`, 'success');
+      else toast(r.error || 'Error', 'error');
+    } catch(e) { toast('Error de conexion', 'error'); }
+    setRebalancing(null);
+  };
+
+  return <div>
+    {/* Score + Summary */}
+    <div style={{display:'grid',gridTemplateColumns:'200px 1fr',gap:16,marginBottom:16}}>
+      <div className="card" style={{padding:20,textAlign:'center'}}>
+        <div style={{fontSize:48,fontWeight:800,color:scoreColor,lineHeight:1}}>{balance_score}</div>
+        <div style={{fontSize:12,color:'var(--muted)',marginTop:4}}>Balance Score</div>
+        <div style={{fontSize:11,color:'var(--muted)',marginTop:8}}>{total_tasks} tasks en {nodes.length} nodos</div>
+      </div>
+      <div className="card" style={{padding:20}}>
+        <div style={{fontSize:13,fontWeight:600,marginBottom:12}}>Distribucion de Tasks</div>
+        {/* Stacked bar */}
+        <div style={{display:'flex',height:32,borderRadius:6,overflow:'hidden',marginBottom:12}}>
+          {nodes.map((n,i) => {
+            const pct = total_tasks > 0 ? (n.tasks_running / total_tasks) * 100 : 0;
+            const colors = ['#3b82f6','#10b981','#f59e0b','#ef4444','#8b5cf6'];
+            return <div key={i} title={`${n.name}: ${n.tasks_running} tasks (${pct.toFixed(0)}%)`}
+              style={{width:`${pct}%`,background:colors[i%colors.length],minWidth:pct>0?2:0,transition:'width .3s'}} />;
+          })}
+        </div>
+        <div style={{display:'flex',gap:16,flexWrap:'wrap'}}>
+          {nodes.map((n,i) => {
+            const colors = ['#3b82f6','#10b981','#f59e0b','#ef4444','#8b5cf6'];
+            const pct = total_tasks > 0 ? ((n.tasks_running / total_tasks) * 100).toFixed(0) : 0;
+            return <div key={i} style={{display:'flex',alignItems:'center',gap:6,fontSize:12}}>
+              <span style={{width:10,height:10,borderRadius:2,background:colors[i%colors.length],display:'inline-block'}} />
+              {n.name}: {n.tasks_running} ({pct}%)
+            </div>;
+          })}
+        </div>
+        {recommendation && <div style={{marginTop:12,padding:'8px 12px',background:'rgba(245,158,11,.1)',border:'1px solid rgba(245,158,11,.3)',borderRadius:6,fontSize:12,color:'var(--yellow)'}}>
+          {recommendation}
+        </div>}
+      </div>
+    </div>
+
+    {/* Node Cards */}
+    <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fit, minmax(360px, 1fr))',gap:16}}>
+      {nodes.map((n, i) => <NodeBalanceCard key={i} node={n} maxTasks={maxTasks} rebalancing={rebalancing} onRebalance={doRebalance} />)}
+    </div>
+  </div>;
+}
+
 // ============== APP ==============
 
 function App() {
@@ -1343,6 +1466,7 @@ function App() {
   const [networks, setNetworks] = useState(null);
   const [volumes, setVolumes] = useState(null);
   const [images, setImages] = useState(null);
+  const [loadBalance, setLoadBalance] = useState(null);
   const [loading, setLoading] = useState(false);
   const [toastMsg, setToastMsg] = useState(null);
   const [modal, setModal] = useState(null);
@@ -1369,6 +1493,7 @@ function App() {
         case 'networks': setNetworks(await api('networks')); break;
         case 'volumes': setVolumes(await api('volumes')); break;
         case 'images': setImages(await api('images')); break;
+        case 'loadbalance': setLoadBalance(await api('load-balance')); break;
       }
     } catch(e) { toast('Error cargando datos','error'); }
     setLoading(false);
@@ -1448,6 +1573,7 @@ function App() {
     {id:'networks', label:'Redes', icon:'R'},
     {id:'volumes', label:'Volumenes', icon:'V'},
     {id:'images', label:'Imagenes', icon:'I'},
+    {id:'loadbalance', label:'Balance', icon:'B'},
     {id:'settings', label:'Ajustes', icon:'*'},
   ];
 
@@ -1486,6 +1612,7 @@ function App() {
       {tab==='networks' && <Networks data={networks} toast={toast} />}
       {tab==='volumes' && <Volumes data={volumes} toast={toast} />}
       {tab==='images' && <Images data={images} toast={toast} />}
+      {tab==='loadbalance' && <LoadBalance data={loadBalance} toast={toast} />}
       {tab==='settings' && <Settings onSave={()=>loadTab('dashboard')} toast={toast} />}
     </div>
 

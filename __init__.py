@@ -1611,6 +1611,157 @@ def _api_node_stats():
     return {'stats': stats}
 
 
+def _api_load_balance():
+    """GET — Load balance overview: tasks per node + resources + balance score."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import math
+
+    cfg = _load_config()
+    hosts = cfg.get('swarm_hosts', [])
+    if not hosts:
+        return {'error': 'No hosts configured'}, 400
+
+    # Get node list from Swarm to map hostnames to IDs
+    swarm_nodes = _docker_json('docker node ls --format "{{json .}}"') or []
+    node_id_map = {}  # hostname -> node_id
+    for n in swarm_nodes:
+        hostname = n.get('Hostname', '')
+        node_id_map[hostname] = n.get('ID', '')
+
+    def fetch_node_data(h):
+        """Fetch tasks + stats for a single node in one SSH call."""
+        hostname_out, _, _ = _ssh_exec(h, command='hostname')
+        hostname = hostname_out.strip()
+        node_id = node_id_map.get(hostname, '')
+
+        # Get running tasks on this node
+        tasks_cmd = (
+            f'docker node ps {node_id} --filter "desired-state=running" '
+            f'--format "{{{{json .}}}}" 2>/dev/null'
+        ) if node_id else 'echo ""'
+        tasks_out, _, tasks_code = _ssh_exec(h, command=tasks_cmd)
+
+        tasks = []
+        services_on_node = []
+        if tasks_code == 0 and tasks_out.strip():
+            for line in tasks_out.strip().split('\n'):
+                line = line.strip()
+                if line:
+                    try:
+                        t = json.loads(line)
+                        tasks.append(t)
+                        svc_name = t.get('Name', '').rsplit('.', 1)[0]
+                        if svc_name and svc_name not in services_on_node:
+                            services_on_node.append(svc_name)
+                    except json.JSONDecodeError:
+                        pass
+
+        # Get CPU/RAM stats
+        stats_cmd = (
+            'echo "{"'
+            ' && echo "\\"cpu_count\\": $(nproc),"'
+            ' && echo "\\"load_1m\\": $(cat /proc/loadavg | cut -d" " -f1),"'
+            ' && free -b | awk \'/^Mem:/ {printf "\\"mem_total\\": %s, \\"mem_used\\": %s,", $2, $3}\''
+            ' && echo "\\"_end\\": 0"'
+            ' && echo "}"'
+        )
+        stats_out, _, stats_code = _ssh_exec(h, command=stats_cmd)
+        cpu_percent = 0.0
+        mem_percent = 0.0
+        mem_used = 0
+        mem_total = 0
+        cpu_count = 0
+        if stats_code == 0:
+            try:
+                s = json.loads(stats_out)
+                cpu_count = s.get('cpu_count', 1)
+                load = float(s.get('load_1m', 0))
+                cpu_percent = round((load / max(cpu_count, 1)) * 100, 1)
+                mem_total = s.get('mem_total', 0)
+                mem_used = s.get('mem_used', 0)
+                mem_percent = round((mem_used / max(mem_total, 1)) * 100, 1)
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        return {
+            'name': h.get('name', hostname),
+            'hostname': hostname,
+            'host': h['host'],
+            'node_id': node_id[:12] if node_id else '',
+            'tasks_running': len(tasks),
+            'cpu_count': cpu_count,
+            'cpu_percent': cpu_percent,
+            'mem_percent': mem_percent,
+            'mem_used': mem_used,
+            'mem_total': mem_total,
+            'services': services_on_node,
+        }
+
+    # Fetch all nodes in parallel
+    nodes_data = []
+    with ThreadPoolExecutor(max_workers=len(hosts), thread_name_prefix='lb-fetch') as pool:
+        futures = {pool.submit(fetch_node_data, h): h for h in hosts}
+        for future in as_completed(futures):
+            try:
+                nodes_data.append(future.result())
+            except Exception as e:
+                h = futures[future]
+                nodes_data.append({
+                    'name': h.get('name', h['host']), 'host': h['host'],
+                    'tasks_running': 0, 'cpu_percent': 0, 'mem_percent': 0,
+                    'services': [], 'error': str(e),
+                })
+
+    # Sort by config order
+    host_order = {h['host']: i for i, h in enumerate(hosts)}
+    nodes_data.sort(key=lambda n: host_order.get(n['host'], 99))
+
+    # Calculate balance score (100 = perfect, 0 = all on one node)
+    total_tasks = sum(n['tasks_running'] for n in nodes_data)
+    active_nodes = [n for n in nodes_data if n['tasks_running'] > 0 or not n.get('error')]
+
+    balance_score = 100
+    recommendation = None
+    if total_tasks > 0 and len(active_nodes) > 1:
+        avg = total_tasks / len(active_nodes)
+        variance = sum((n['tasks_running'] - avg) ** 2 for n in active_nodes) / len(active_nodes)
+        std_dev = math.sqrt(variance)
+        # Normalize: score = 100 when std_dev=0, drops towards 0
+        balance_score = max(0, round(100 - (std_dev / max(avg, 1)) * 100))
+
+        # Find most overloaded node
+        max_node = max(active_nodes, key=lambda n: n['tasks_running'])
+        if max_node['tasks_running'] > avg * 1.3:
+            pct_over = round(((max_node['tasks_running'] - avg) / avg) * 100)
+            recommendation = f"{max_node['name']} tiene {pct_over}% más tasks que el promedio ({max_node['tasks_running']} vs {avg:.0f})"
+
+    return {
+        'nodes': nodes_data,
+        'total_tasks': total_tasks,
+        'balance_score': balance_score,
+        'recommendation': recommendation,
+        'updated_at': datetime.now().isoformat(),
+    }
+
+
+def _api_rebalance_service():
+    """POST — Force rebalance a service. Body: {service_name}"""
+    err = _require_admin()
+    if err:
+        return err
+    data = request.get_json() or {}
+    service_name = data.get('service_name', '')
+    if not service_name or not all(c.isalnum() or c in '-_.' for c in service_name):
+        return {'error': 'Valid service_name required'}, 400
+
+    result = _docker_cmd(f'docker service update --force {service_name} 2>&1')
+    if result is not None:
+        log_audit(_get_username(), 'docker.service_rebalance',
+                  f'Force rebalanced service {service_name}')
+        return {'success': True, 'message': f'Service {service_name} rebalancing'}
+    return {'error': 'Rebalance failed'}, 500
+
+
 # ---------------------------------------------------------------------------
 # Plugin entry point
 # ---------------------------------------------------------------------------
@@ -1651,6 +1802,8 @@ def register(app):
         'image-remove': _api_image_remove,
         'volume-remove': _api_volume_remove,
         'network-remove': _api_network_remove,
+        'load-balance': _api_load_balance,
+        'rebalance-service': _api_rebalance_service,
         'config': _api_get_config,
         'config/save': _api_save_config,
         'test-connection': _api_test_connection,
