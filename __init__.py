@@ -501,6 +501,26 @@ def _fetch_images():
 # Background polling
 # ---------------------------------------------------------------------------
 
+def _bg_poll_once():
+    """Run a single poll cycle, fetching all data in parallel."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    fetchers = {
+        'overview': _fetch_overview,
+        'nodes': _fetch_nodes,
+        'services': _fetch_services,
+        'stacks': _fetch_stacks,
+    }
+    with ThreadPoolExecutor(max_workers=4, thread_name_prefix='swarm-fetch') as pool:
+        futures = {pool.submit(fn): key for key, fn in fetchers.items()}
+        for future in as_completed(futures):
+            key = futures[future]
+            try:
+                _cache_set(key, future.result())
+            except Exception as e:
+                log.error(f"[{PLUGIN_ID}] Fetch {key} failed: {e}")
+
+
 def _bg_poll():
     """Background thread that refreshes cache periodically."""
     cfg = _load_config()
@@ -509,17 +529,7 @@ def _bg_poll():
 
     while not _bg_stop.is_set():
         try:
-            overview = _fetch_overview()
-            _cache_set('overview', overview)
-
-            nodes = _fetch_nodes()
-            _cache_set('nodes', nodes)
-
-            services = _fetch_services()
-            _cache_set('services', services)
-
-            stacks = _fetch_stacks()
-            _cache_set('stacks', stacks)
+            _bg_poll_once()
         except Exception as e:
             log.error(f"[{PLUGIN_ID}] Background poll error: {e}")
 
