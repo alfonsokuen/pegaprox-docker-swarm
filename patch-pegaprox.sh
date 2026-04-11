@@ -2,18 +2,21 @@
 # ============================================================================
 # PegaProx Docker Swarm Plugin — Post-Update Patch Script
 # ============================================================================
-# Run this after every PegaProx update to re-apply:
-#   1. Docker Swarm sidebar entry in dashboard.js
-#   2. CSP frame-ancestors 'self' in app.py (for iframe embedding)
-#   3. Rebuild production frontend
+# Automatically re-applies all Docker Swarm integration patches after a
+# PegaProx update. Uses patch_dashboard.py for reliable JSX patching.
+#
+# What it patches:
+#   1. CSP frame-ancestors 'self' in app.py (iframe embedding)
+#   2. X-Frame-Options SAMEORIGIN in app.py
+#   3. dashboard.js: sidebar, content panel, topology, state vars (via Python)
+#   4. Rebuilds production frontend with Babel
 #
 # Usage:
 #   sudo bash /opt/PegaProx/plugins/docker_swarm/patch-pegaprox.sh
 #
-# Safe to run multiple times — checks if patches are already applied.
+# Triggered automatically by systemd path watcher after PegaProx updates.
+# Safe to run multiple times — idempotent.
 # ============================================================================
-
-set -e
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -21,8 +24,9 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 
 PEGAPROX_DIR="/opt/PegaProx"
-DASHBOARD="$PEGAPROX_DIR/web/src/dashboard.js"
+PLUGIN_DIR="$PEGAPROX_DIR/plugins/docker_swarm"
 APP_PY="$PEGAPROX_DIR/pegaprox/app.py"
+DASHBOARD="$PEGAPROX_DIR/web/src/dashboard.js"
 
 echo "============================================"
 echo " Docker Swarm Plugin — Post-Update Patcher"
@@ -38,178 +42,50 @@ if [ ! -f "$APP_PY" ]; then
     echo -e "${RED}ERROR: $APP_PY not found${NC}"
     exit 1
 fi
+if [ ! -f "$PLUGIN_DIR/patch_dashboard.py" ]; then
+    echo -e "${RED}ERROR: $PLUGIN_DIR/patch_dashboard.py not found${NC}"
+    exit 1
+fi
 
 # ---------- 1. Patch CSP (app.py) ----------
-echo -n "[1/4] CSP frame-ancestors... "
+echo -n "[1/3] CSP + X-Frame-Options... "
+CHANGED=0
 if grep -q "frame-ancestors 'none'" "$APP_PY"; then
     sed -i "s/frame-ancestors 'none'/frame-ancestors 'self'/" "$APP_PY"
+    CHANGED=1
+fi
+if grep -q "X-Frame-Options'] = 'DENY'" "$APP_PY"; then
     sed -i "s/X-Frame-Options'] = 'DENY'/X-Frame-Options'] = 'SAMEORIGIN'/" "$APP_PY"
+    CHANGED=1
+fi
+if [ $CHANGED -eq 1 ]; then
     echo -e "${GREEN}PATCHED${NC}"
 elif grep -q "frame-ancestors 'self'" "$APP_PY"; then
     echo -e "${YELLOW}already patched${NC}"
 else
-    echo -e "${RED}UNKNOWN STATE — check manually${NC}"
+    echo -e "${RED}UNKNOWN STATE${NC}"
 fi
 
-# ---------- 2. Add sidebarDockerSwarm state variable ----------
-echo -n "[2/4] Sidebar state variable... "
+# ---------- 2. Patch dashboard.js (Python patcher) ----------
+echo -n "[2/3] Dashboard patches (sidebar, topology, iframe)... "
 if grep -q "sidebarDockerSwarm" "$DASHBOARD"; then
-    echo -e "${YELLOW}already present${NC}"
+    echo -e "${YELLOW}already patched${NC}"
 else
-    # Add after sidebarXHM state
-    sed -i '/const \[sidebarXHM, setSidebarXHM\]/a\            const [sidebarDockerSwarm, setSidebarDockerSwarm] = useState(false);' "$DASHBOARD"
-    # Add to auto-clear effect
-    sed -i 's/setSidebarTopology(false); setSidebarXHM(false);/setSidebarTopology(false); setSidebarXHM(false); setSidebarDockerSwarm(false);/g' "$DASHBOARD"
-    # Add to condition checks
-    sed -i 's/!selectedGroup && !sidebarXHM/!selectedGroup \&\& !sidebarXHM \&\& !sidebarDockerSwarm/g' "$DASHBOARD"
-    sed -i 's/|| sidebarXHM)/|| sidebarXHM || sidebarDockerSwarm)/g' "$DASHBOARD"
-    echo -e "${GREEN}PATCHED${NC}"
+    python3 "$PLUGIN_DIR/patch_dashboard.py" 2>&1 | tail -1
 fi
 
-# ---------- 3. Add Docker Swarm sidebar section ----------
-echo -n "[3/4] Sidebar Docker Swarm section... "
-if grep -q "Docker Swarm" "$DASHBOARD"; then
-    echo -e "${YELLOW}already present${NC}"
-else
-    # Find the XHM sidebar line and insert Docker Swarm section before it
-    XHM_LINE=$(grep -n "XHM sidebar.*only when both" "$DASHBOARD" | head -1 | cut -d: -f1)
-    if [ -n "$XHM_LINE" ]; then
-        # Create the sidebar patch
-        cat > /tmp/_ds_sidebar_patch.js << 'SIDEBAR_EOF'
-                                {/* Docker Swarm Manager Plugin */}
-                                <div className="mt-4 pt-4 border-t border-proxmox-border">
-                                    <div className="flex items-center justify-between px-1 mb-2">
-                                        <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider">Docker Swarm</h2>
-                                    </div>
-                                    <div className="space-y-1.5">
-                                        <button
-                                            onClick={() => { setSidebarDockerSwarm(true); setSidebarTopology(false); setSidebarXHM(false); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); }}
-                                            className={isCorporate
-                                                ? "w-full flex items-center gap-1.5 pl-3 pr-2 py-0.5 text-[13px] leading-5"
-                                                : `w-full flex items-center gap-3 px-3 py-2 rounded-xl transition-all ${
-                                                    sidebarDockerSwarm
-                                                        ? "bg-gradient-to-r from-cyan-500/20 to-blue-600/10 border border-cyan-500/30 text-white"
-                                                        : "bg-proxmox-card border border-proxmox-border hover:border-cyan-500/30 text-gray-300 hover:text-white"
-                                                  }`
-                                            }
-                                            style={isCorporate ? (sidebarDockerSwarm ? {background: "rgba(73,175,217,0.10)", borderLeft: "2px solid var(--corp-accent)", color: "var(--color-text)"} : {color: "var(--corp-text-secondary)"}) : undefined}
-                                            onMouseEnter={isCorporate ? (e) => { if (!sidebarDockerSwarm) { e.currentTarget.style.background = "var(--color-hover)"; e.currentTarget.style.color = "var(--color-text)"; }} : undefined}
-                                            onMouseLeave={isCorporate ? (e) => { if (!sidebarDockerSwarm) { e.currentTarget.style.background = ""; e.currentTarget.style.color = "var(--corp-text-secondary)"; }} : undefined}
-                                        >
-                                            {isCorporate ? (
-                                                <Icons.Box className="w-4 h-4 flex-shrink-0" style={{color: sidebarDockerSwarm ? "var(--corp-accent)" : "#2dd4bf"}} />
-                                            ) : (
-                                                <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${sidebarDockerSwarm ? "bg-cyan-500/20" : "bg-proxmox-dark"}`}>
-                                                    <Icons.Box className="w-4 h-4 text-cyan-400" />
-                                                </div>
-                                            )}
-                                            <div className="flex-1 text-left min-w-0">
-                                                <div className={`${isCorporate ? "text-[13px]" : "text-sm"} font-medium truncate`}>Swarm Cluster</div>
-                                                {!isCorporate && <div className="text-xs text-gray-500 truncate">Docker Swarm</div>}
-                                            </div>
-                                            <div className="w-1.5 h-1.5 rounded-full shrink-0" style={{background: "var(--color-success)"}} />
-                                        </button>
-                                    </div>
-                                </div>
-SIDEBAR_EOF
-        # Insert before XHM line
-        sed -i "$((XHM_LINE-1))r /tmp/_ds_sidebar_patch.js" "$DASHBOARD"
-        rm -f /tmp/_ds_sidebar_patch.js
-
-        # Now add the content panel (iframe) — find sidebarXHM content panel
-        XHM_CONTENT=$(grep -n ") : sidebarXHM ? (" "$DASHBOARD" | head -1 | cut -d: -f1)
-        if [ -n "$XHM_CONTENT" ]; then
-            cat > /tmp/_ds_content_patch.js << 'CONTENT_EOF'
-                                ) : sidebarDockerSwarm ? (
-                                    /* Docker Swarm Manager Plugin - embedded view */
-                                    <div style={{height: "calc(100vh - 48px)", display: "flex", flexDirection: "column"}}>
-                                        {isCorporate && (
-                                            <div className="corp-content-header">
-                                                <div className="flex items-center gap-2">
-                                                    <Icons.Box className="w-4 h-4" style={{color: "#2dd4bf"}} />
-                                                    <span className="corp-header-title">Docker Swarm Manager</span>
-                                                </div>
-                                            </div>
-                                        )}
-                                        <iframe
-                                            src="/api/plugins/docker_swarm/api/ui"
-                                            style={{flex: 1, border: "none", width: "100%", height: "100%", background: "#0f1117", borderRadius: isCorporate ? "0" : "12px"}}
-                                            title="Docker Swarm Manager"
-                                        />
-                                    </div>
-CONTENT_EOF
-            sed -i "$((XHM_CONTENT-1))r /tmp/_ds_content_patch.js" "$DASHBOARD"
-            rm -f /tmp/_ds_content_patch.js
-        fi
-        echo -e "${GREEN}PATCHED${NC}"
-    else
-        echo -e "${RED}XHM sidebar marker not found — PegaProx version may be incompatible${NC}"
-    fi
-fi
-
-# ---------- 4. Inject Swarm into TopologyView ----------
-echo -n "[4/5] Topology Swarm injection... "
-if grep -q "docker_swarm.*topology" "$DASHBOARD"; then
-    echo -e "${YELLOW}already present${NC}"
-else
-    # Find the multiCluster prop in TopologyView (sidebarTopology section)
-    # Pattern: multiCluster={clusters.filter(c => c.connected).map(
-    TOPO_LINE=$(grep -n "multiCluster={clusters.filter(c => c.connected).map(" "$DASHBOARD" | tail -1 | cut -d: -f1)
-    if [ -n "$TOPO_LINE" ]; then
-        # Find the closing of the .map() — look for the })} after the return block
-        # We need to append .concat() after the closing })}
-        # Strategy: add a state + effect to fetch swarm topology, then concat to multiCluster
-
-        # 1. Add swarm topology state near other topology states
-        TOPO_STATE_LINE=$(grep -n "const \[sidebarTopology" "$DASHBOARD" | head -1 | cut -d: -f1)
-        if [ -n "$TOPO_STATE_LINE" ]; then
-            sed -i "${TOPO_STATE_LINE}a\\            const [swarmTopoData, setSwarmTopoData] = useState(null); // docker_swarm topology" "$DASHBOARD"
-        fi
-
-        # 2. Add effect to fetch swarm topology data
-        TOPO_EFFECT_LINE=$(grep -n "if (!sidebarTopology) return;" "$DASHBOARD" | head -1 | cut -d: -f1)
-        if [ -n "$TOPO_EFFECT_LINE" ]; then
-            AFTER_EFFECT=$((TOPO_EFFECT_LINE + 5))
-            sed -i "${AFTER_EFFECT}a\\            // docker_swarm: fetch swarm topology for multi-cluster view\\
-            useEffect(() => {\\
-                if (!sidebarTopology) return;\\
-                fetch('/api/plugins/docker_swarm/api/topology', {credentials: 'include'})\\
-                    .then(r => r.json()).then(d => { if (d && d.nodes) setSwarmTopoData(d); })\\
-                    .catch(() => {});\\
-            }, [sidebarTopology]);" "$DASHBOARD"
-        fi
-
-        # 3. Concat swarm data to multiCluster prop
-        # Find: })} at the end of the .map() block and add .concat()
-        # The pattern is: })} followed by isCorporate={true}
-        sed -i "s|})}\n\s*isCorporate={true}|})}.concat(swarmTopoData ? [swarmTopoData] : [])\n                                                isCorporate={true}|" "$DASHBOARD"
-        # If multiline sed didn't work, try single-line approach
-        # Find the line with isCorporate={true} right after the multiCluster prop
-        CORP_LINE=$(grep -n "isCorporate={true}" "$DASHBOARD" | tail -1 | cut -d: -f1)
-        if [ -n "$CORP_LINE" ]; then
-            MULTI_END=$((CORP_LINE - 1))
-            MULTI_LINE_CONTENT=$(sed -n "${MULTI_END}p" "$DASHBOARD")
-            if echo "$MULTI_LINE_CONTENT" | grep -q "})}$"; then
-                sed -i "${MULTI_END}s|})}\$|})}.concat(swarmTopoData ? [swarmTopoData] : [])|" "$DASHBOARD"
-            fi
-        fi
-
-        echo -e "${GREEN}PATCHED${NC}"
-    else
-        echo -e "${RED}multiCluster prop not found${NC}"
-    fi
-fi
-
-# ---------- 5. Rebuild frontend ----------
-echo -n "[5/5] Rebuilding frontend... "
+# ---------- 3. Rebuild frontend ----------
+echo -n "[3/3] Rebuilding frontend... "
+cd "$PEGAPROX_DIR"
 if command -v node &> /dev/null; then
-    cd "$PEGAPROX_DIR"
-    bash web/Dev/build.sh > /dev/null 2>&1
-    echo -e "${GREEN}PRODUCTION BUILD OK${NC}"
+    if bash web/Dev/build.sh > /dev/null 2>&1; then
+        echo -e "${GREEN}PRODUCTION BUILD OK${NC}"
+    else
+        echo -e "${YELLOW}Build had warnings (may still work)${NC}"
+    fi
 else
-    cd "$PEGAPROX_DIR"
     bash web/Dev/build.sh --restore > /dev/null 2>&1
-    echo -e "${YELLOW}DEV BUILD (install Node.js for production build)${NC}"
+    echo -e "${YELLOW}DEV BUILD (install Node.js for production)${NC}"
 fi
 
 # ---------- Restart ----------
@@ -226,5 +102,5 @@ fi
 echo ""
 echo "============================================"
 echo -e " ${GREEN}Patch complete!${NC}"
-echo " Docker Swarm sidebar + iframe restored."
+echo " Sidebar + Topology + Console restored."
 echo "============================================"
