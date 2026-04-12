@@ -363,6 +363,23 @@ PathModified=$PEGAPROX_DIR/pegaprox/app.py
 WantedBy=multi-user.target
 EOF
 
+# Create auto-patch wrapper script (avoids systemd quoting issues with inline bash)
+cat > "$PLUGIN_DIR/auto-patch.sh" << 'APEOF'
+#!/bin/bash
+LOCK=/tmp/.pegaprox-patching
+if [ -f "$LOCK" ]; then echo "Skipping - patch in progress"; exit 0; fi
+sleep 3
+if grep -q sidebarDockerSwarm /opt/PegaProx/web/src/dashboard.js 2>/dev/null && \
+   grep -q "frame-ancestors" /opt/PegaProx/pegaprox/app.py 2>/dev/null; then
+    echo "Patch not needed"
+    exit 0
+fi
+touch "$LOCK"
+/bin/bash /opt/PegaProx/plugins/docker_swarm/patch-pegaprox.sh
+rm -f "$LOCK"
+APEOF
+chmod +x "$PLUGIN_DIR/auto-patch.sh"
+
 cat > /etc/systemd/system/pegaprox-swarm-patch.service << 'EOF'
 [Unit]
 Description=Re-apply Docker Swarm plugin patches after PegaProx update
@@ -370,7 +387,7 @@ After=pegaprox.service
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -c "LOCK=/tmp/.pegaprox-patching; if [ -f $LOCK ]; then exit 0; fi; sleep 3; if grep -q sidebarDockerSwarm /opt/PegaProx/web/src/dashboard.js 2>/dev/null && grep -q \"frame-ancestors 'self'\" /opt/PegaProx/pegaprox/app.py 2>/dev/null; then exit 0; fi; touch $LOCK; /bin/bash /opt/PegaProx/plugins/docker_swarm/patch-pegaprox.sh; rm -f $LOCK"
+ExecStart=/bin/bash /opt/PegaProx/plugins/docker_swarm/auto-patch.sh
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=pegaprox-swarm-patch
