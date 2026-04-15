@@ -142,6 +142,142 @@ function Modal({ title, onClose, children }) {
 
 // ============== PAGES ==============
 
+// DiskPruneBar — botones de limpieza manual en Dashboard.
+function DiskPruneBar({ onRefresh }) {
+  const [busy, setBusy] = React.useState('');
+  const [result, setResult] = React.useState(null);
+  const targets = [
+    { id: 'build-cache', label: 'Build cache', color: 'var(--blue,#3b82f6)', confirm: false },
+    { id: 'images', label: 'Imágenes >24h', color: 'var(--blue,#3b82f6)', confirm: false },
+    { id: 'containers', label: 'Contenedores parados', color: 'var(--muted)', confirm: false },
+    { id: 'networks', label: 'Redes no usadas', color: 'var(--muted)', confirm: false },
+    { id: 'all-safe', label: 'Todo (seguro)', color: 'var(--yellow,#f59e0b)', confirm: true },
+    { id: 'volumes', label: 'Volúmenes huérfanos', color: 'var(--red,#ef4444)', confirm: true },
+    { id: 'all', label: 'TODO + volúmenes', color: 'var(--red,#ef4444)', confirm: true },
+  ];
+  async function runPrune(t) {
+    if (t.confirm && !window.confirm(`⚠️  ${t.label}\n\nEsta acción afectará TODOS los nodos. ${t.id==='volumes'||t.id==='all'?'Puede borrar datos de volúmenes no montados.':'Es reversible (solo recupera espacio).'}\n\n¿Continuar?`)) return;
+    setBusy(t.id); setResult(null);
+    try {
+      const r = await fetch(`${API}/disk/prune`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ target: t.id, all_nodes: true }) });
+      const j = await r.json();
+      setResult(j);
+      if (onRefresh) onRefresh();
+    } catch (e) { setResult({ error: String(e) }); }
+    setBusy('');
+  }
+  return <div style={{marginTop:14,paddingTop:14,borderTop:'1px solid var(--border)'}}>
+    <div style={{fontSize:11,color:'var(--muted)',marginBottom:8,textTransform:'uppercase'}}>Limpieza manual</div>
+    <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
+      {targets.map(t => (
+        <button key={t.id} disabled={!!busy}
+          onClick={()=>runPrune(t)}
+          style={{padding:'6px 10px',fontSize:12,background:busy===t.id?'var(--muted)':t.color,color:'#fff',border:'none',borderRadius:4,cursor:busy?'wait':'pointer',opacity:busy&&busy!==t.id?0.5:1}}>
+          {busy===t.id?'…':'🧹 '+t.label}
+        </button>
+      ))}
+    </div>
+    {result && <div style={{marginTop:10,padding:10,background:'var(--bg)',borderRadius:4,fontSize:12}}>
+      {result.error
+        ? <span style={{color:'var(--red,#ef4444)'}}>Error: {result.error}</span>
+        : <>
+            <strong>{result.description}</strong> · Liberado total: <strong style={{color:'var(--green,#10b981)'}}>{result.total_freed_human}</strong>
+            <details style={{marginTop:6}}><summary style={{cursor:'pointer',color:'var(--muted)'}}>Detalle por nodo</summary>
+              <ul style={{margin:'6px 0 0 18px',fontSize:11}}>
+                {(result.results||[]).map((r,i) => <li key={i}>{r.name||r.host}: {r.freed_bytes>0?`+${(r.freed_bytes/1024/1024).toFixed(1)} MB`:'0'} {r.exit_code!==0 && <span style={{color:'var(--red,#ef4444)'}}>(exit {r.exit_code})</span>}</li>)}
+              </ul>
+            </details>
+          </>}
+    </div>}
+  </div>;
+}
+
+// DiskAutoPruneSettings — panel en Settings para política automática.
+function DiskAutoPruneSettings({ toast }) {
+  const [cfg, setCfg] = React.useState(null);
+  const [saving, setSaving] = React.useState(false);
+  const [available, setAvailable] = React.useState([]);
+  React.useEffect(() => {
+    fetch(`${API}/disk/settings`).then(r=>r.json()).then(j => {
+      setCfg(j.disk_auto_prune || {});
+      setAvailable((j.available_targets||[]).filter(t => t!=='volumes' && t!=='all'));
+    });
+  }, []);
+  if (!cfg) return <div className="card">Cargando…</div>;
+  async function save() {
+    setSaving(true);
+    try {
+      const r = await fetch(`${API}/disk/settings`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(cfg) });
+      const j = await r.json();
+      if (j.error) toast && toast('Error: '+j.error, 'error');
+      else { setCfg(j.disk_auto_prune); toast && toast('Auto-prune guardado', 'success'); }
+    } catch(e){ toast && toast('Error de red', 'error'); }
+    setSaving(false);
+  }
+  async function runNow() {
+    if (!window.confirm('¿Ejecutar auto-prune ahora en los nodos sobre el umbral?')) return;
+    setSaving(true);
+    try {
+      const r = await fetch(`${API}/disk/auto-prune/run`, { method:'POST', headers:{'Content-Type':'application/json'}, body: '{}' });
+      const j = await r.json();
+      if (j.error) toast && toast('Error: '+j.error, 'error');
+      else { setCfg(j.disk_auto_prune); toast && toast('Auto-prune ejecutado', 'success'); }
+    } catch(e){ toast && toast('Error de red', 'error'); }
+    setSaving(false);
+  }
+  const toggleTarget = (t) => setCfg(c => ({ ...c, targets: c.targets.includes(t) ? c.targets.filter(x=>x!==t) : [...c.targets, t] }));
+  return <div className="card" style={{marginTop:16}}>
+    <h4 style={{marginTop:0}}>🧹 Auto-prune de disco</h4>
+    <p style={{fontSize:12,color:'var(--muted)',marginBottom:16}}>
+      Ejecuta limpieza automática en cada nodo cuyo disco supere el umbral. <strong>No toca volúmenes</strong> (prohibido en modo automático por seguridad).
+    </p>
+    <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fit,minmax(260px,1fr))',gap:16}}>
+      <div>
+        <label style={{display:'flex',alignItems:'center',gap:8,cursor:'pointer'}}>
+          <input type="checkbox" checked={!!cfg.enabled} onChange={e=>setCfg({...cfg, enabled:e.target.checked})} />
+          <span style={{fontWeight:600}}>{cfg.enabled?'Activo':'Desactivado'}</span>
+        </label>
+      </div>
+      <div>
+        <label style={{fontSize:12,color:'var(--muted)'}}>Umbral disco (%)</label>
+        <input type="number" min={50} max={95} value={cfg.threshold_pct||80}
+          onChange={e=>setCfg({...cfg, threshold_pct:parseInt(e.target.value)||80})}
+          style={{width:'100%',padding:6,borderRadius:4,border:'1px solid var(--border)',background:'var(--bg)',color:'var(--fg)'}} />
+        <div style={{fontSize:11,color:'var(--muted)',marginTop:2}}>Se dispara cuando / supera este porcentaje en cualquier nodo</div>
+      </div>
+      <div>
+        <label style={{fontSize:12,color:'var(--muted)'}}>Revisar cada (min)</label>
+        <input type="number" min={5} max={1440} value={cfg.check_interval_min||30}
+          onChange={e=>setCfg({...cfg, check_interval_min:parseInt(e.target.value)||30})}
+          style={{width:'100%',padding:6,borderRadius:4,border:'1px solid var(--border)',background:'var(--bg)',color:'var(--fg)'}} />
+      </div>
+    </div>
+    <div style={{marginTop:16}}>
+      <div style={{fontSize:12,color:'var(--muted)',marginBottom:6}}>Qué limpiar (en orden)</div>
+      <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
+        {available.map(t => (
+          <label key={t} style={{padding:'4px 10px',border:'1px solid var(--border)',borderRadius:4,fontSize:12,cursor:'pointer',background:cfg.targets.includes(t)?'var(--blue,#3b82f6)':'var(--bg)',color:cfg.targets.includes(t)?'#fff':'var(--fg)'}}>
+            <input type="checkbox" style={{display:'none'}} checked={cfg.targets.includes(t)} onChange={()=>toggleTarget(t)} />
+            {cfg.targets.includes(t)?'✓ ':''}{t}
+          </label>
+        ))}
+      </div>
+    </div>
+    {cfg.last_run && <div style={{marginTop:16,padding:10,background:'var(--bg)',borderRadius:4,fontSize:12}}>
+      <div style={{color:'var(--muted)'}}>Última ejecución: {new Date(cfg.last_run).toLocaleString()}</div>
+      <div>Liberado: <strong style={{color:'var(--green,#10b981)'}}>{((cfg.last_run_freed_bytes||0)/1024/1024).toFixed(1)} MB</strong></div>
+    </div>}
+    <div style={{marginTop:16,display:'flex',gap:8}}>
+      <button onClick={save} disabled={saving} style={{padding:'8px 16px',background:'var(--blue,#3b82f6)',color:'#fff',border:'none',borderRadius:4,cursor:'pointer'}}>
+        {saving?'Guardando…':'💾 Guardar política'}
+      </button>
+      <button onClick={runNow} disabled={saving} style={{padding:'8px 16px',background:'var(--yellow,#f59e0b)',color:'#fff',border:'none',borderRadius:4,cursor:'pointer'}}>
+        ▶ Ejecutar ahora
+      </button>
+    </div>
+  </div>;
+}
+
 // Dashboard — enhanced visual design
 function Dashboard({ overview, nodeStats, loadBalance, onRefresh, loading }) {
   if (!overview || overview.error) return <div className="card" style={{textAlign:'center',padding:60}}>
@@ -234,13 +370,14 @@ function Dashboard({ overview, nodeStats, loadBalance, onRefresh, loading }) {
       </div>
     </div>
 
-    {/* Disk Usage — horizontal bars */}
+    {/* Disk Usage — horizontal bars + prune actions */}
     {(overview.disk_usage||[]).length > 0 && <div className="card" style={{marginBottom:16}}>
-      <h4 style={{fontSize:13,color:'var(--muted)',marginBottom:12}}>Disk Usage (Manager)</h4>
+      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:12}}>
+        <h4 style={{fontSize:13,color:'var(--muted)',margin:0}}>Disk Usage (Manager)</h4>
+        <span style={{fontSize:11,color:'var(--muted)'}}>Acciones afectan TODOS los nodos</span>
+      </div>
       <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fit, minmax(200px, 1fr))',gap:12}}>
         {overview.disk_usage.map((d,i) => {
-          const sizeMatch = (d.Size||'').match(/([\d.]+)/);
-          const reclMatch = (d.Reclaimable||'').match(/([\d.]+)/);
           const pctMatch = (d.Reclaimable||'').match(/\((\d+)%\)/);
           const pct = pctMatch ? parseInt(pctMatch[1]) : 0;
           return <div key={i} style={{padding:12,background:'var(--bg)',borderRadius:6}}>
@@ -255,6 +392,7 @@ function Dashboard({ overview, nodeStats, loadBalance, onRefresh, loading }) {
           </div>;
         })}
       </div>
+      <DiskPruneBar onRefresh={onRefresh} />
     </div>}
 
     {/* Task Balance Summary */}
@@ -1366,6 +1504,8 @@ function Settings({ onSave, toast }) {
       <button className="btn" onClick={addHost}>+ Agregar Host</button>
       <button className="btn btn-primary" onClick={save}>Guardar Configuracion</button>
     </div>
+
+    <DiskAutoPruneSettings toast={toast} />
   </div>;
 }
 

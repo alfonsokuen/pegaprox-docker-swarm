@@ -522,16 +522,30 @@ def _bg_poll_once():
 
 
 def _bg_poll():
-    """Background thread that refreshes cache periodically."""
+    """Background thread that refreshes cache periodically + runs disk auto-prune."""
     cfg = _load_config()
     interval = cfg.get('poll_interval', 30)
     log.info(f"[{PLUGIN_ID}] Background poll started (interval={interval}s)")
 
+    last_disk_check = 0
     while not _bg_stop.is_set():
         try:
             _bg_poll_once()
         except Exception as e:
             log.error(f"[{PLUGIN_ID}] Background poll error: {e}")
+
+        # Disk auto-prune check según intervalo configurable
+        try:
+            cfg_now = _load_config()
+            auto = cfg_now.get('disk_auto_prune', {})
+            if auto.get('enabled'):
+                check_min = auto.get('check_interval_min', 30)
+                now_ts = time.time()
+                if now_ts - last_disk_check >= check_min * 60:
+                    _disk_auto_prune_tick()
+                    last_disk_check = now_ts
+        except Exception as e:
+            log.error(f"[{PLUGIN_ID}] Auto-prune tick error: {e}")
 
         _bg_stop.wait(interval)
 
@@ -1763,6 +1777,216 @@ def _api_rebalance_service():
 
 
 # ---------------------------------------------------------------------------
+# Disk management: manual prune + automatic policy
+# ---------------------------------------------------------------------------
+
+# Whitelist de targets válidos → comando Docker + descripción
+_PRUNE_TARGETS = {
+    'build-cache': ('docker builder prune -a -f', 'Build cache'),
+    'images':      ('docker image prune -a -f --filter "until=24h"', 'Imágenes > 24h sin uso'),
+    'containers':  ('docker container prune -f', 'Contenedores parados'),
+    'volumes':     ('docker volume prune -f', 'Volúmenes huérfanos (¡cuidado!)'),
+    'networks':    ('docker network prune -f', 'Redes no usadas'),
+    'all-safe':    ('docker builder prune -a -f && docker image prune -a -f --filter "until=24h" && docker container prune -f && docker network prune -f', 'Todo excepto volúmenes (seguro)'),
+    'all':         ('docker system prune -a -f --volumes', 'Todo incluyendo volúmenes (DESTRUCTIVO)'),
+}
+
+
+def _disk_prune_node(host_cfg, target):
+    """Execute prune command on a specific node. Returns dict with status + freed bytes."""
+    cmd_str, _ = _PRUNE_TARGETS.get(target, (None, None))
+    if not cmd_str:
+        return {'host': host_cfg.get('host'), 'error': f'Unknown target: {target}'}
+    # Capturar df antes/después para calcular bytes liberados
+    before_cmd = "df -B1 --output=avail / | tail -1"
+    out_before, _, _ = _ssh_exec(host_cfg, command=before_cmd, timeout=30)
+    try:
+        before_bytes = int(out_before.strip())
+    except (ValueError, AttributeError):
+        before_bytes = 0
+
+    out, err, code = _ssh_exec(host_cfg, command=cmd_str + ' 2>&1', timeout=300)
+
+    out_after, _, _ = _ssh_exec(host_cfg, command=before_cmd, timeout=30)
+    try:
+        after_bytes = int(out_after.strip())
+    except (ValueError, AttributeError):
+        after_bytes = 0
+
+    freed = max(0, after_bytes - before_bytes)
+    return {
+        'host': host_cfg.get('host'),
+        'name': host_cfg.get('name', host_cfg.get('host')),
+        'target': target,
+        'exit_code': code,
+        'freed_bytes': freed,
+        'output': (out or err or '')[-2000:],
+    }
+
+
+def _api_disk_prune():
+    """POST — Prune disk on one or all nodes. Body: {target, node_host?, all_nodes?}"""
+    err = _require_admin()
+    if err:
+        return err
+    data = request.get_json() or {}
+    target = data.get('target', '')
+    if target not in _PRUNE_TARGETS:
+        return {'error': f'Invalid target. Valid: {list(_PRUNE_TARGETS.keys())}'}, 400
+
+    cfg = _load_config()
+    all_hosts = cfg.get('swarm_hosts', [])
+    if not all_hosts:
+        return {'error': 'No swarm hosts configured'}, 400
+
+    node_host = data.get('node_host', '')
+    all_nodes = bool(data.get('all_nodes', False))
+
+    if all_nodes:
+        targets_hosts = all_hosts
+    elif node_host:
+        targets_hosts = [h for h in all_hosts if h['host'] == node_host]
+        if not targets_hosts:
+            return {'error': f'Node {node_host} not in config'}, 400
+    else:
+        return {'error': 'Provide node_host or all_nodes=true'}, 400
+
+    results = []
+    with ThreadPoolExecutor(max_workers=max(1, len(targets_hosts)), thread_name_prefix='disk-prune') as pool:
+        futures = [pool.submit(_disk_prune_node, h, target) for h in targets_hosts]
+        for fut in as_completed(futures):
+            try:
+                results.append(fut.result())
+            except Exception as e:
+                results.append({'error': str(e)})
+
+    total_freed = sum(r.get('freed_bytes', 0) for r in results)
+    log_audit(_get_username(), 'docker.disk_prune',
+              f'target={target} nodes={[r.get("host") for r in results]} freed={total_freed} bytes')
+    return {
+        'success': True,
+        'target': target,
+        'description': _PRUNE_TARGETS[target][1],
+        'results': results,
+        'total_freed_bytes': total_freed,
+        'total_freed_human': _human_bytes(total_freed),
+    }
+
+
+def _human_bytes(n):
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if abs(n) < 1024:
+            return f'{n:.1f} {unit}'
+        n /= 1024
+    return f'{n:.1f} PB'
+
+
+def _api_disk_settings():
+    """GET/POST — Auto-prune policy. Body (POST): {enabled, threshold_pct, targets, check_interval_min}"""
+    cfg = _load_config()
+    auto = cfg.get('disk_auto_prune', {
+        'enabled': False,
+        'threshold_pct': 80,           # dispara cuando disk > 80%
+        'targets': ['build-cache', 'images'],  # qué purgar (lista)
+        'check_interval_min': 30,      # cada cuántos minutos revisa
+        'last_run': None,
+        'last_run_freed_bytes': 0,
+    })
+
+    if request.method == 'GET':
+        return {'disk_auto_prune': auto, 'available_targets': list(_PRUNE_TARGETS.keys())}
+
+    err = _require_admin()
+    if err:
+        return err
+    data = request.get_json() or {}
+    # Validación
+    new_auto = dict(auto)
+    if 'enabled' in data:
+        new_auto['enabled'] = bool(data['enabled'])
+    if 'threshold_pct' in data:
+        try:
+            v = int(data['threshold_pct'])
+            if not (50 <= v <= 95):
+                return {'error': 'threshold_pct must be 50-95'}, 400
+            new_auto['threshold_pct'] = v
+        except (TypeError, ValueError):
+            return {'error': 'threshold_pct must be int'}, 400
+    if 'targets' in data:
+        tgs = data['targets']
+        if not isinstance(tgs, list) or not all(t in _PRUNE_TARGETS for t in tgs):
+            return {'error': f'targets must be subset of {list(_PRUNE_TARGETS.keys())}'}, 400
+        # 'volumes' y 'all' requieren confirmación explícita en la UI — aquí no los permitimos auto
+        if 'volumes' in tgs or 'all' in tgs:
+            return {'error': 'volumes/all prohibidos en auto-prune (muy destructivo)'}, 400
+        new_auto['targets'] = tgs
+    if 'check_interval_min' in data:
+        try:
+            v = int(data['check_interval_min'])
+            if not (5 <= v <= 1440):
+                return {'error': 'check_interval_min must be 5-1440'}, 400
+            new_auto['check_interval_min'] = v
+        except (TypeError, ValueError):
+            return {'error': 'check_interval_min must be int'}, 400
+
+    cfg['disk_auto_prune'] = new_auto
+    _save_config(cfg)
+    log_audit(_get_username(), 'docker.disk_auto_prune_config', f'updated: {new_auto}')
+    return {'disk_auto_prune': new_auto, 'success': True}
+
+
+def _disk_auto_prune_tick():
+    """Background tick: check disk % on each node; if > threshold, run auto-prune."""
+    cfg = _load_config()
+    auto = cfg.get('disk_auto_prune', {})
+    if not auto.get('enabled'):
+        return
+    threshold = auto.get('threshold_pct', 80)
+    targets = auto.get('targets', ['build-cache', 'images'])
+    hosts = cfg.get('swarm_hosts', [])
+    now_iso = datetime.now().isoformat()
+    total_freed = 0
+    actions = []
+
+    for h in hosts:
+        # df -h percent
+        out, _, _ = _ssh_exec(h, command="df / | tail -1 | awk '{print $5}' | tr -d '%'", timeout=15)
+        try:
+            pct = int(out.strip())
+        except (ValueError, AttributeError):
+            continue
+        if pct < threshold:
+            continue
+        # Sobre threshold → correr targets en orden
+        log.info(f"[{PLUGIN_ID}] auto-prune {h['host']}: disk={pct}% > {threshold}%, targets={targets}")
+        for t in targets:
+            r = _disk_prune_node(h, t)
+            total_freed += r.get('freed_bytes', 0)
+            actions.append({'host': h['host'], 'target': t, 'freed_bytes': r.get('freed_bytes', 0)})
+
+    if actions:
+        cfg['disk_auto_prune']['last_run'] = now_iso
+        cfg['disk_auto_prune']['last_run_freed_bytes'] = total_freed
+        cfg['disk_auto_prune']['last_run_actions'] = actions
+        _save_config(cfg)
+        log_audit('auto-prune', 'docker.disk_auto_prune',
+                  f'freed={total_freed} actions={len(actions)}')
+
+
+def _api_disk_auto_prune_run():
+    """POST — Trigger auto-prune logic manually (debug/immediate)."""
+    err = _require_admin()
+    if err:
+        return err
+    try:
+        _disk_auto_prune_tick()
+        cfg = _load_config()
+        return {'success': True, 'disk_auto_prune': cfg.get('disk_auto_prune', {})}
+    except Exception as e:
+        return {'error': str(e)}, 500
+
+
+# ---------------------------------------------------------------------------
 # Plugin entry point
 # ---------------------------------------------------------------------------
 
@@ -1808,6 +2032,10 @@ def register(app):
         'config/save': _api_save_config,
         'test-connection': _api_test_connection,
         'refresh': _api_refresh,
+        # Disk management
+        'disk/prune': _api_disk_prune,
+        'disk/settings': _api_disk_settings,
+        'disk/auto-prune/run': _api_disk_auto_prune_run,
     }
 
     for path, handler in routes.items():
