@@ -66,16 +66,31 @@ else
     echo -e "${RED}UNKNOWN STATE${NC}"
 fi
 
+# ---------- 1b. Safety backup of dashboard.js before any patching ----------
+BACKUP_DIR="/opt/PegaProx/_backups"
+mkdir -p "$BACKUP_DIR"
+BACKUP_PATH="$BACKUP_DIR/dashboard.js.$(date +%Y%m%d-%H%M%S)"
+cp -a "$DASHBOARD" "$BACKUP_PATH"
+echo "      Backup: $BACKUP_PATH"
+
 # ---------- 2. Patch dashboard.js (Python patcher) ----------
-echo -n "[2/3] Dashboard patches (sidebar, topology, iframe)... "
+echo -n "[2/4] Dashboard patches (sidebar, topology, iframe)... "
 if grep -q "sidebarDockerSwarm" "$DASHBOARD"; then
     echo -e "${YELLOW}already patched${NC}"
 else
     python3 "$PLUGIN_DIR/patch_dashboard.py" 2>&1 | tail -1
 fi
 
-# ---------- 3. Rebuild frontend ----------
-echo -n "[3/3] Rebuilding frontend... "
+# ---------- 3. VNC console modal fix (PegaProx 0.9.6.1 regression) ----------
+echo -n "[3/4] Console modal height fix... "
+if grep -q "ds-console-modal-fix" "$DASHBOARD"; then
+    echo -e "${YELLOW}already patched${NC}"
+else
+    python3 "$PLUGIN_DIR/patch_console_modal.py" 2>&1 | tail -1
+fi
+
+# ---------- 4. Rebuild frontend ----------
+echo -n "[4/4] Rebuilding frontend... "
 cd "$PEGAPROX_DIR"
 if command -v node &> /dev/null; then
     if bash web/Dev/build.sh > /dev/null 2>&1; then

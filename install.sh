@@ -370,6 +370,7 @@ LOCK=/tmp/.pegaprox-patching
 if [ -f "$LOCK" ]; then echo "Skipping - patch in progress"; exit 0; fi
 sleep 3
 if grep -q sidebarDockerSwarm /opt/PegaProx/web/src/dashboard.js 2>/dev/null && \
+   grep -q ds-console-modal-fix /opt/PegaProx/web/src/dashboard.js 2>/dev/null && \
    grep -q "frame-ancestors" /opt/PegaProx/pegaprox/app.py 2>/dev/null; then
     echo "Patch not needed"
     exit 0
