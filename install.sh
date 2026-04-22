@@ -366,11 +366,13 @@ EOF
 # Create auto-patch wrapper script (avoids systemd quoting issues with inline bash)
 cat > "$PLUGIN_DIR/auto-patch.sh" << 'APEOF'
 #!/bin/bash
+# Auto-patcher triggered by pegaprox-swarm-patch.path when PegaProx rewrites
+# dashboard.js or app.py. Nginx-layer fixes live independently so they are
+# not part of this trigger — they persist across PegaProx updates by design.
 LOCK=/tmp/.pegaprox-patching
 if [ -f "$LOCK" ]; then echo "Skipping - patch in progress"; exit 0; fi
 sleep 3
 if grep -q sidebarDockerSwarm /opt/PegaProx/web/src/dashboard.js 2>/dev/null && \
-   grep -q ds-console-modal-fix /opt/PegaProx/web/src/dashboard.js 2>/dev/null && \
    grep -q "frame-ancestors" /opt/PegaProx/pegaprox/app.py 2>/dev/null; then
     echo "Patch not needed"
     exit 0

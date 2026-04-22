@@ -81,12 +81,21 @@ else
     python3 "$PLUGIN_DIR/patch_dashboard.py" 2>&1 | tail -1
 fi
 
-# ---------- 3. VNC console modal fix (PegaProx 0.9.6.1 regression) ----------
-echo -n "[3/4] Console modal height fix... "
-if grep -q "ds-console-modal-fix" "$DASHBOARD"; then
-    echo -e "${YELLOW}already patched${NC}"
+# ---------- 3. VNC console modal fix — nginx sub_filter (PERMANENT) ----------
+# Preferred path: inject the missing Tailwind arbitrary-value CSS rule
+# (`.h-\[85vh\]{height:85vh}`) via nginx, so PegaProx auto-updates cannot
+# break it. Falls back to the legacy in-bundle patcher if nginx is not in
+# use (direct-mode PegaProx on :443).
+echo "[3/4] Console modal height fix (nginx sub_filter)..."
+if [ -f /etc/nginx/sites-available/pegaprox ]; then
+    bash "$PLUGIN_DIR/patch_nginx_fixes.sh" 2>&1 | sed 's/^/      /'
 else
-    python3 "$PLUGIN_DIR/patch_console_modal.py" 2>&1 | tail -1
+    echo -n "      nginx not detected — fallback to in-bundle patch... "
+    if grep -q "ds-console-modal-fix" "$DASHBOARD"; then
+        echo -e "${YELLOW}already patched${NC}"
+    else
+        python3 "$PLUGIN_DIR/patch_console_modal.py" 2>&1 | tail -1
+    fi
 fi
 
 # ---------- 4. Rebuild frontend ----------
