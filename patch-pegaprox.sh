@@ -86,9 +86,15 @@ fi
 # (`.h-\[85vh\]{height:85vh}`) via nginx, so PegaProx auto-updates cannot
 # break it. Falls back to the legacy in-bundle patcher if nginx is not in
 # use (direct-mode PegaProx on :443).
-echo "[3/4] Console modal height fix (nginx sub_filter)..."
+echo "[3/4] Console modal height fix (nginx sub_filter + self-heal watcher)..."
 if [ -f /etc/nginx/sites-available/pegaprox ]; then
     bash "$PLUGIN_DIR/patch_nginx_fixes.sh" 2>&1 | sed 's/^/      /'
+    # Install systemd path watcher so the include is re-wired automatically
+    # if anything ever rewrites the nginx config (install.sh re-run, apt
+    # upgrade, manual edit, etc.). This is the self-healing layer.
+    if [ -f "$PLUGIN_DIR/setup_nginx_watcher.sh" ]; then
+        bash "$PLUGIN_DIR/setup_nginx_watcher.sh" 2>&1 | sed 's/^/      /'
+    fi
 else
     echo -n "      nginx not detected — fallback to in-bundle patch... "
     if grep -q "ds-console-modal-fix" "$DASHBOARD"; then

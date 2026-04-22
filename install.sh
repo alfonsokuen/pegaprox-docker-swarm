@@ -346,6 +346,15 @@ NGINXEOF
     fi
 fi
 
+# Always wire the permanent CSS fixes + self-healing watcher after any nginx
+# (re)configuration. Idempotent; no-op if already in place.
+if [ -f /etc/nginx/sites-available/pegaprox ] && [ -f "$PLUGIN_DIR/patch_nginx_fixes.sh" ]; then
+    echo ""
+    echo -e "  ${BOLD}Wiring permanent nginx fixes...${NC}"
+    bash "$PLUGIN_DIR/patch_nginx_fixes.sh" 2>&1 | sed 's/^/    /'
+    bash "$PLUGIN_DIR/setup_nginx_watcher.sh" 2>&1 | sed 's/^/    /'
+fi
+
 # ── Auto-patch for persistence ──
 echo ""
 echo -e "${BLUE}[7/7] Setting up auto-patch for PegaProx updates...${NC}"
