@@ -1826,6 +1826,7 @@ def _disk_prune_node(host_cfg, target):
 
 def _api_disk_prune():
     """POST — Prune disk on one or all nodes. Body: {target, node_host?, all_nodes?}"""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     err = _require_admin()
     if err:
         return err
