@@ -4,6 +4,45 @@ All notable changes to the PegaProx Docker Swarm plugin are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This
 project follows Semantic Versioning.
 
+## [1.9.1] — 2026-04-24
+
+### Fixed — v1.9.0 regression: `subprotocols=['binary']` rejected clients that don't advertise a subprotocol
+
+v1.9.0 added `subprotocols=['binary']` to `websockets.serve(...)` to fix the
+noVNC "close 1006" regression in PegaProx 0.9.7. That unblocked browsers
+with modern noVNC bundles but introduced a new failure mode:
+
+- `websockets` library's default behaviour when `subprotocols=` is set and
+  the client offers nothing in common is `NegotiationError` → **HTTP 400
+  Bad Request** with empty body.
+- Every permissive client stops working: `curl`, `wscat`, internal health
+  probes, and — critically — **any browser running a cached old noVNC that
+  doesn't advertise `binary`**.
+
+Observed on CT 119 (2026-04-24 15:01 UTC): the user saw "Connecting…"
+forever because their browser had cached an older noVNC; nginx access log
+showed `GET …/vncwebsocket?token=… 400 60` for every retry.
+
+### Changed
+
+- **`patch_vnc_subprotocol.py`** now installs a permissive
+  `select_subprotocol=` callback instead of advertising `subprotocols=`.
+  The callback returns `'binary'` if the client offered it (noVNC modern
+  case → handshake echoes back, browser fires `open` with
+  `ws.protocol = 'binary'`) and `None` otherwise (handshake completes with
+  no subprotocol negotiated — RFC-valid, works for every permissive client).
+  The `DS-VNC-SUBPROTOCOL` marker is preserved so the watcher skip-check
+  stays stable, and the patcher now handles three input states idempotently:
+  stock PegaProx 0.9.7, v1.9.0-patched, and v1.9.1-patched.
+
+### Verified on CT 119
+
+  | Client                           | Before v1.9.1   | After v1.9.1                    |
+  |----------------------------------|-----------------|---------------------------------|
+  | Browser with `['binary']`        | 101 + RFB       | 101 + `Protocol: binary` + RFB  |
+  | Browser with no subprotocol      | **400 empty**   | 101 + RFB                       |
+  | curl / wscat / nc (no subproto)  | **400 empty**   | 101 + RFB                       |
+
 ## [1.9.0] — 2026-04-24
 
 ### Fixed — PegaProx 0.9.7 compatibility (VNC/xterm console: "Error de conexión")
