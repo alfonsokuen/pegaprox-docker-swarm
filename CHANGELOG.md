@@ -4,6 +4,47 @@ All notable changes to the PegaProx Docker Swarm plugin are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This
 project follows Semantic Versioning.
 
+## [1.9.3] — 2026-04-24
+
+### Added — persistence layer (2 new defence-in-depth units)
+
+The filesystem watcher from v1.8.3 (`pegaprox-patch.path`) is fast (<3 s
+response to file changes) but can miss a few edge cases:
+  - PegaProx updates that replace files via atomic `mv` with identical mtime
+  - Host reboot mid-update, so the PathChanged event is never delivered
+  - Manual edits that rewrite a file without changing its checksum
+  - Plugin reinstalls that rewrite every file in a tight loop faster than
+    systemd.path debounce
+
+`setup_persistence.sh` (new, idempotent) installs two extra units:
+
+- **`pegaprox-patch-ensure.timer`** — periodic (`OnBootSec=20s`,
+  `OnUnitActiveSec=5min`). Fires `pegaprox-patch-ensure.service`, which
+  runs `ensure-patches.sh` — a tiny script that greps for all five
+  expected markers (`sidebarDockerSwarm`, `frame-ancestors`,
+  `DS-VNC-SUBPROTOCOL`, `DS-VNC-AUTH-CONTEXT`,
+  `DS-VNC-TICKET-PASSTHROUGH`) and only runs the full orchestrator if any
+  of them is missing. Cheap no-op when everything is healthy.
+- **`pegaprox-patch-boot.service`** — oneshot, `WantedBy=multi-user.target`.
+  Runs the same drift check once every boot, independent of the timer
+  (belt-and-suspenders for the case where the timer is ever disabled).
+
+### Changed
+
+- `patch-pegaprox.sh` now ends with an unconditional call to
+  `setup_persistence.sh`, so every patch cycle refreshes the healing
+  units (in case they were stopped, masked, or the unit files were
+  overwritten).
+
+### Persistence layers now in place
+
+  | Layer | Mechanism                                       | Trigger          | Latency   |
+  |-------|-------------------------------------------------|------------------|-----------|
+  | 1     | `pegaprox-patch.path`                           | inotify          | <3 s      |
+  | 2     | `pegaprox-patch-ensure.timer`                   | every 5 min      | ≤5 min    |
+  | 3     | `pegaprox-patch-boot.service`                   | every boot       | ~1 boot   |
+  | 4     | `pegaprox-nginx-fix.path` (v1.8.3, unchanged)   | inotify on nginx | <3 s      |
+
 ## [1.9.2] — 2026-04-24
 
 ### Fixed — VM console actually connects (Authentication failure / invalid PVEVNC ticket)

@@ -220,6 +220,14 @@ echo -e "      ${GREEN}production bundle contains sidebarDockerSwarm${NC}"
 chown pegaprox:pegaprox "$PEGAPROX_DIR/web/index.html" 2>/dev/null || true
 chown -R pegaprox:pegaprox "$PEGAPROX_DIR/web/Dev/.build" 2>/dev/null || true
 
+# ---------- 5. Persistence layer (idempotent) ----------
+# Installs / refreshes the systemd timer + boot unit that self-heal if any
+# marker drifts away (covers edge cases the filesystem watcher misses:
+# atomic mv-replace with same mtime, host reboot during update, manual edits).
+if [ -f "$PLUGIN_DIR/setup_persistence.sh" ]; then
+    bash "$PLUGIN_DIR/setup_persistence.sh" 2>&1 | sed 's/^/      /'
+fi
+
 # ---------- Restart ----------
 echo ""
 echo -n "Restarting PegaProx... "
