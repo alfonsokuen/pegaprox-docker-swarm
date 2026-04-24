@@ -24,6 +24,7 @@ Description=Watch PegaProx files for changes and re-apply docker_swarm patches
 PathChanged=/opt/PegaProx/web/src/dashboard.js
 PathChanged=/opt/PegaProx/pegaprox/app.py
 PathChanged=/opt/PegaProx/pegaprox/api/vms.py
+PathChanged=/opt/PegaProx/web/src/node_modals.js
 Unit=pegaprox-patch.service
 
 [Install]

@@ -116,6 +116,39 @@ else
     fi
 fi
 
+# ---------- 3c. VNC full-stack fix: subprotocol + auth-context + ticket passthrough ----------
+# Three coordinated fixes required to make the VM console actually work on
+# PegaProx 0.9.7 (all documented verbosely in their respective patchers):
+#   patch_vnc_subprotocol.py     → permissive select_subprotocol so noVNC's
+#                                  ['binary'] handshake is accepted (fixes
+#                                  close-1006 regression)
+#   patch_vnc_auth_context.py    → UI passes its ticket/port in the WS URL +
+#                                  server skips the double POST /vncproxy and
+#                                  reuses manager._api_token / _ticket for the
+#                                  upstream WS (fixes "Authentication failure"
+#                                  RFB-layer + "invalid PVEVNC ticket" upstream)
+VMS_PY="$PEGAPROX_DIR/pegaprox/api/vms.py"
+NODE_MODALS="$PEGAPROX_DIR/web/src/node_modals.js"
+echo "[3c/4] VNC full-stack fix (subprotocol + auth-context + ticket passthrough)..."
+if [ ! -f "$PLUGIN_DIR/patch_vnc_auth_context.py" ]; then
+    echo -e "      ${YELLOW}patch_vnc_auth_context.py not present — skipping auth-context fix${NC}"
+elif grep -q "DS-VNC-AUTH-CONTEXT" "$VMS_PY" && grep -q "DS-VNC-TICKET-PASSTHROUGH" "$NODE_MODALS"; then
+    echo -e "      ${YELLOW}auth-context already applied${NC}"
+else
+    cp -a "$VMS_PY" "$BACKUP_DIR/vms.py.pre-authctx.$(date +%Y%m%d-%H%M%S)"
+    cp -a "$NODE_MODALS" "$BACKUP_DIR/node_modals.js.pre-authctx.$(date +%Y%m%d-%H%M%S)"
+    if ! python3 "$PLUGIN_DIR/patch_vnc_auth_context.py" 2>&1 | sed 's/^/      /'; then
+        echo -e "      ${RED}patch_vnc_auth_context.py FAILED — aborting${NC}"
+        exit 1
+    fi
+    if ! python3 -c "import ast; ast.parse(open('$VMS_PY').read())" 2>/dev/null; then
+        echo -e "      ${RED}vms.py post-patch syntax check FAILED — restoring${NC}"
+        cp -a "$BACKUP_DIR/vms.py.pre-authctx.$(date +%Y%m%d-%H%M%S)" "$VMS_PY"
+        exit 1
+    fi
+    echo -e "      ${GREEN}auth-context + ticket passthrough applied (vms.py + node_modals.js)${NC}"
+fi
+
 # ---------- 3b. VNC WebSocket subprotocol fix (PegaProx 0.9.7) ----------
 # PegaProx 0.9.7's `websockets.serve(vnc_handler, ...)` does not pass
 # `subprotocols=` — but noVNC opens the socket with `new WebSocket(url,

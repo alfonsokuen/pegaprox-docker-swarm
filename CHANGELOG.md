@@ -4,6 +4,80 @@ All notable changes to the PegaProx Docker Swarm plugin are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This
 project follows Semantic Versioning.
 
+## [1.9.2] — 2026-04-24
+
+### Fixed — VM console actually connects (Authentication failure / invalid PVEVNC ticket)
+
+After v1.9.1 unblocked the WebSocket handshake, the console still failed:
+the modal showed "Connecting…" forever, nginx logged `101 72`, and our
+diagnostic probe recorded exactly `sent=29B recv=60B` on every session —
+the wire-shape of an RFB "Authentication failure" (12 server-hello + 3 sec-
+types + 16 challenge + 30 bytes of auth-fail + reason string).
+
+Root cause, confirmed end-to-end:
+
+1. Browser calls `GET /vnc` → PegaProx POSTs `/vncproxy` on PVE → ticket_A.
+   PVE's side-effect is `set_password vnc <ticket_A>` on the QEMU monitor,
+   so QEMU's VNC password is now `ticket_A[:8]` (the DES key used at RFB
+   level).
+2. Browser opens the WebSocket with `new RFB(url, {password: ticket_A})`.
+3. PegaProx's VNC handler (port 5001) ran a **fresh login** and POSTed
+   `/vncproxy` **a second time** → ticket_B. Side-effect: QEMU's VNC
+   password is rewritten to `ticket_B[:8]`, silently invalidating
+   `ticket_A`.
+4. Browser sends `DES(ticket_A[:8])(challenge)`; QEMU expects
+   `DES(ticket_B[:8])(challenge)` → mismatch → `Authentication failure`.
+
+Additional complication: PegaProx connects to Proxmox via an auto-created
+**API token** (`root@pam!pegaprox_…`), not a user/password session. The
+handler's fresh login produced a PVEAuthCookie that did **not** match the
+token-emitted ticket, so when we first tried "just use the browser's
+ticket" in v1.9.2-attempt-1, PVE returned
+`Handshake status 401 permission denied - invalid PVEVNC ticket` for the
+upstream WebSocket.
+
+### Added
+
+- **`patch_vnc_auth_context.py`** (new, idempotent, markers
+  `DS-VNC-AUTH-CONTEXT` in `pegaprox/api/vms.py` and
+  `DS-VNC-TICKET-PASSTHROUGH` in `web/src/node_modals.js`) — the full fix:
+  - **UI** appends `&vncticket=…&vncport=…` to the WebSocket URL so the
+    handler can use the same ticket the browser already has.
+  - **Server** stops the second POST `/vncproxy` when those params are
+    present, and the upstream WebSocket handshake reuses whichever
+    credential the manager is already using:
+      * `manager._using_api_token` → `Authorization: PVEAPIToken=…`
+      * elif `manager._ticket`     → `Cookie: PVEAuthCookie=…`
+      * else → fresh login fallback (cold-start edge case only).
+
+### Changed
+
+- **`patch-pegaprox.sh`** gains step `[3c/4]` that runs
+  `patch_vnc_auth_context.py` with a syntax-check rollback guard, between
+  the nginx console-modal fix and the frontend rebuild.
+- **`auto-patch.sh`** skip condition now also requires
+  `DS-VNC-AUTH-CONTEXT` (in vms.py) and `DS-VNC-TICKET-PASSTHROUGH` (in
+  node_modals.js) to be present; otherwise it re-runs the orchestrator
+  after any PegaProx auto-update that stomps either file.
+- **`setup_path_watcher.sh`** refreshes `pegaprox-patch.path` to also
+  monitor `web/src/node_modals.js` (fourth watched file; previously
+  dashboard.js + app.py + vms.py).
+
+### Verified on CT 119 with diagvnc + real user browser
+
+  Playwright probe (diagvnc, VM 120 on pve2) reached the RFB challenge
+  (16 B) for the first time in this investigation:
+
+      t= 273 ms   open, ws.protocol = "binary"
+      t=1651 ms   msg 12 B   "RFB 003.008\n"      ← server hello
+      t=1773 ms   msg  2 B   0x01 0x02            ← sec-types: VNC auth
+      t=1893 ms   msg 16 B   (random)             ← VNC challenge
+
+  The user then confirmed the real browser ("ya funciono") — noVNC
+  performs DES(ticket_A[:8])(challenge), QEMU still holds ticket_A[:8]
+  because the handler no longer overwrites it, auth succeeds, session
+  proceeds to framebuffer.
+
 ## [1.9.1] — 2026-04-24
 
 ### Fixed — v1.9.0 regression: `subprotocols=['binary']` rejected clients that don't advertise a subprotocol

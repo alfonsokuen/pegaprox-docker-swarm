@@ -7,7 +7,9 @@ if [ -f "$LOCK" ]; then echo "Skipping - patch in progress"; exit 0; fi
 sleep 3
 if grep -q sidebarDockerSwarm /opt/PegaProx/web/src/dashboard.js 2>/dev/null && \
    grep -q "frame-ancestors" /opt/PegaProx/pegaprox/app.py 2>/dev/null && \
-   grep -q "DS-VNC-SUBPROTOCOL" /opt/PegaProx/pegaprox/api/vms.py 2>/dev/null; then
+   grep -q "DS-VNC-SUBPROTOCOL" /opt/PegaProx/pegaprox/api/vms.py 2>/dev/null && \
+   grep -q "DS-VNC-AUTH-CONTEXT" /opt/PegaProx/pegaprox/api/vms.py 2>/dev/null && \
+   grep -q "DS-VNC-TICKET-PASSTHROUGH" /opt/PegaProx/web/src/node_modals.js 2>/dev/null; then
     echo "Patch not needed"
     exit 0
 fi
