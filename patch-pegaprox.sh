@@ -17,6 +17,15 @@
 # Triggered automatically by systemd path watcher after PegaProx updates.
 # Safe to run multiple times — idempotent.
 # ============================================================================
+# Patches applied by this orchestrator (in order):
+#   1. CSP frame-ancestors 'self' + X-Frame-Options SAMEORIGIN (app.py)
+#   2. dashboard.js — sidebar "DOCKER SWARM" + iframe + topology (9 JSX patches)
+#   3. Nginx sub_filter snippet to inject the missing Tailwind `h-[85vh]` CSS
+#      rule (permanent fix for collapsed VNC/xterm console modal)
+#   3b. vms.py — VNC WebSocket `subprotocols=['binary']` negotiation (fixes
+#       the browser close-1006 regression in PegaProx 0.9.7)
+#   4. Production frontend rebuild (Babel) with fail-loud + post-check
+# ============================================================================
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -74,11 +83,14 @@ cp -a "$DASHBOARD" "$BACKUP_PATH"
 echo "      Backup: $BACKUP_PATH"
 
 # ---------- 2. Patch dashboard.js (Python patcher) ----------
-echo -n "[2/4] Dashboard patches (sidebar, topology, iframe)... "
+echo "[2/4] Dashboard patches (sidebar, topology, iframe)..."
 if grep -q "sidebarDockerSwarm" "$DASHBOARD"; then
-    echo -e "${YELLOW}already patched${NC}"
+    echo -e "      ${YELLOW}already patched${NC}"
 else
-    python3 "$PLUGIN_DIR/patch_dashboard.py" 2>&1 | tail -1
+    if ! python3 "$PLUGIN_DIR/patch_dashboard.py" 2>&1 | sed 's/^/      /'; then
+        echo -e "      ${RED}patch_dashboard.py FAILED — aborting${NC}"
+        exit 1
+    fi
 fi
 
 # ---------- 3. VNC console modal fix — nginx sub_filter (PERMANENT) ----------
@@ -104,19 +116,76 @@ else
     fi
 fi
 
+# ---------- 3b. VNC WebSocket subprotocol fix (PegaProx 0.9.7) ----------
+# PegaProx 0.9.7's `websockets.serve(vnc_handler, ...)` does not pass
+# `subprotocols=` — but noVNC opens the socket with `new WebSocket(url,
+# ['binary'])`. RFC 6455: when the client advertises subprotocols the server
+# MUST echo one back or browsers close with code 1006 before the `open`
+# event fires. Symptom: VM console modal shows "Error de conexión" or
+# "Reconnecting (2/3)…" (permissive clients like curl/nc/wscat work, which
+# hides the bug from upstream tests).
+VMS_PY="$PEGAPROX_DIR/pegaprox/api/vms.py"
+echo "[3b/4] VNC WebSocket subprotocol negotiation..."
+if [ ! -f "$PLUGIN_DIR/patch_vnc_subprotocol.py" ]; then
+    echo -e "      ${YELLOW}patch_vnc_subprotocol.py not present — skipping${NC}"
+elif grep -q "DS-VNC-SUBPROTOCOL" "$VMS_PY"; then
+    echo -e "      ${YELLOW}already patched${NC}"
+else
+    # Safety backup
+    cp -a "$VMS_PY" "$BACKUP_DIR/vms.py.pre-vncfix.$(date +%Y%m%d-%H%M%S)"
+    if ! python3 "$PLUGIN_DIR/patch_vnc_subprotocol.py" 2>&1 | sed 's/^/      /'; then
+        echo -e "      ${RED}patch_vnc_subprotocol.py FAILED — aborting${NC}"
+        exit 1
+    fi
+    # Syntax sanity (this file is 6000+ lines of PegaProx core, we must not bork it)
+    if ! python3 -c "import ast; ast.parse(open('$VMS_PY').read())" 2>/dev/null; then
+        echo -e "      ${RED}post-patch syntax check FAILED — restoring backup${NC}"
+        cp -a "$BACKUP_DIR/vms.py.pre-vncfix.$(date +%Y%m%d-%H%M%S)" "$VMS_PY"
+        exit 1
+    fi
+    echo -e "      ${GREEN}vms.py patched (2 subprotocol=['binary'] additions)${NC}"
+fi
+
 # ---------- 4. Rebuild frontend ----------
-echo -n "[4/4] Rebuilding frontend... "
+# v1.9: fail-loud build. PegaProx 0.9.6.1 split dashboard.js into 17 files
+# (concatenated by web/Dev/build.sh → web/index.html). The previous `> /dev/null
+# 2>&1` masked real build failures (stale root-owned .build/app.jsx from an
+# earlier root-run blocking subsequent writes) and the patcher reported OK
+# while the production bundle still served the unpatched release.
+echo "[4/4] Rebuilding frontend (production, fail-loud)..."
 cd "$PEGAPROX_DIR"
-if command -v node &> /dev/null; then
-    if bash web/Dev/build.sh > /dev/null 2>&1; then
-        echo -e "${GREEN}PRODUCTION BUILD OK${NC}"
-    else
-        echo -e "${YELLOW}Build had warnings (may still work)${NC}"
+
+# Ensure the build cache is writable by whoever runs us. If a previous
+# run (as a different user) left root-owned artefacts, cat > app.jsx
+# would EPERM and the build would silently abort.
+if [ -d web/Dev/.build ]; then
+    rm -f web/Dev/.build/app.jsx web/Dev/.build/app.js 2>/dev/null || true
+fi
+
+if ! command -v node &> /dev/null; then
+    echo -e "      ${YELLOW}Node.js missing — falling back to dev build${NC}"
+    if ! bash web/Dev/build.sh --restore 2>&1 | sed 's/^/      /'; then
+        echo -e "      ${RED}dev build FAILED${NC}"
+        exit 1
     fi
 else
-    bash web/Dev/build.sh --restore > /dev/null 2>&1
-    echo -e "${YELLOW}DEV BUILD (install Node.js for production)${NC}"
+    if ! bash web/Dev/build.sh 2>&1 | sed 's/^/      /'; then
+        echo -e "      ${RED}production build FAILED — sidebar will be missing${NC}"
+        exit 1
+    fi
 fi
+
+# Verify the patches actually reached the production bundle.
+if ! grep -q "sidebarDockerSwarm" "$PEGAPROX_DIR/web/index.html"; then
+    echo -e "      ${RED}post-build sanity check FAILED: 'sidebarDockerSwarm' missing from web/index.html${NC}"
+    exit 1
+fi
+echo -e "      ${GREEN}production bundle contains sidebarDockerSwarm${NC}"
+
+# Normalise ownership so Flask (running as pegaprox) can serve the new bundle
+# regardless of who triggered the patch (root via systemd, pegaprox manually, etc.).
+chown pegaprox:pegaprox "$PEGAPROX_DIR/web/index.html" 2>/dev/null || true
+chown -R pegaprox:pegaprox "$PEGAPROX_DIR/web/Dev/.build" 2>/dev/null || true
 
 # ---------- Restart ----------
 echo ""
