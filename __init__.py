@@ -3323,11 +3323,33 @@ def _start_rebalance_job(candidates, delay_sec, username):
             else:
                 cmd = f"docker service update --force {shlex.quote(name)}"
                 out = _docker_cmd(cmd + ' 2>&1')
-                if out is not None:
-                    success = True
-                    output = (out or '')[:200]
-                else:
+                if out is None:
                     err = 'docker_cmd returned None'
+                else:
+                    # v1.14.2: distinguish real success from auto-rollback.
+                    # `docker service update --force` exits 0 even when the
+                    # orchestrator rolled the change back because of a deadlock
+                    # (e.g. start-first + max_replicas_per_node=1 + replicas==nodes).
+                    # Check UpdateStatus.State to know whether tasks actually moved.
+                    state_cmd = (
+                        f"docker service inspect {shlex.quote(name)} "
+                        f"--format '{{{{.UpdateStatus.State}}}}'"
+                    )
+                    state = (_docker_cmd(state_cmd) or '').strip()
+                    output = (out or '')[:200]
+                    if state.startswith('rollback'):
+                        err = (
+                            f'auto-rolled back (state={state}). Tasks did not migrate. '
+                            f'Likely cause: update_config.order=start-first with '
+                            f'max_replicas_per_node and replicas equal-to-nodes — '
+                            f'change order to stop-first or relax the placement cap.'
+                        )
+                    elif state in ('updating', 'paused', 'rollback_started'):
+                        # Force is synchronous, so this is unexpected; flag it.
+                        err = f'update did not finish (state={state})'
+                    else:
+                        # 'completed', empty, or '<no value>' (no UpdateStatus key) = real success
+                        success = True
 
             with _rebalance_jobs_lock:
                 _rebalance_jobs[job_id]['results'].append({

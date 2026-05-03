@@ -4,6 +4,52 @@ All notable changes to the PegaProx Docker Swarm plugin are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This
 project follows Semantic Versioning.
 
+## [1.14.2] — 2026-05-03
+
+Hotfix surfaced by the first end-to-end rebalance after v1.14.1: the worker
+was marking services as ✓ success even when Swarm had silently auto-rolled
+back the deploy, so the UI counter advanced but tasks never actually
+migrated. The rebalance "completed" with no change in distribution.
+
+### Why this happens
+
+`docker service update --force` exits 0 in two very different scenarios:
+
+1. **Real success** — tasks recreated, `UpdateStatus.State == "completed"`.
+2. **Auto-rollback** — orchestrator hit a deadlock (most commonly:
+   `update_config.order=start-first` + `max_replicas_per_node=1` +
+   `replicas == swarm_nodes`), the new tasks never schedule (`Pending`,
+   `"no suitable node (max replicas per node limit exceed)"`), the 5 s
+   `Monitor` window times out, `FailureAction: rollback` triggers, the
+   previous tasks are reinstated, and the CLI returns 0 with
+   `UpdateStatus.State == "rollback_completed"`.
+
+Before 1.14.2, both paths were indistinguishable from the worker's view.
+
+### Fixed
+
+After every force-update, the worker now inspects
+`{{.UpdateStatus.State}}` and treats:
+
+- `completed`, empty, `<no value>` → real success
+- `rollback_*` → **failure**, with an explanatory `error` message in the job
+  results (and surfaced in the UI's last-6-finished list as ✗)
+- `updating` / `paused` / `rollback_started` → flagged as "did not finish"
+
+The error message also names the most common root cause and the fix:
+`change order to stop-first or relax the placement cap`. The aim is that
+operators reading the rebalance results can act on the diagnosis without
+needing to know Swarm internals.
+
+### What this changes for the UI
+
+The live progress card already rendered ✗ for `success: false` results;
+v1.14.2 just makes that signal trustworthy. A rebalance whose final state
+is "completed_with_errors" now actually means something: that many
+services ran into deadlocks and need their `update_config` reviewed.
+
+---
+
 ## [1.14.1] — 2026-05-03
 
 Hotfix to v1.14.0 surfaced by the first real-world rebalance run: each
