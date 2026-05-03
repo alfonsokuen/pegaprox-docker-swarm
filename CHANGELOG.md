@@ -4,6 +4,89 @@ All notable changes to the PegaProx Docker Swarm plugin are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This
 project follows Semantic Versioning.
 
+## [1.11.0] — 2026-05-02
+
+Phase 1 of the durable-cluster-health story: the **Policy Auditor**. The
+plugin now grades every service A–F against best-practice policies and
+surfaces concrete fix hints. Read-only — never mutates services.
+
+### Added — Policy Auditor
+
+A new `Auditoría` tab + two API endpoints. The auditor runs ten checks
+against each service's spec (the same data already collected by
+`_fetch_services`) and aggregates a grade. The reasoning is in
+`_run_cluster_audit()` and lives entirely in Python — no extra SSH cost.
+
+The ten checks, by severity:
+
+| ID | Sev | What it asks |
+|---|---|---|
+| `replicas_vs_nodes` | P0 | Are `replicas ≤ healthy nodes`? Otherwise some replicas can never schedule. |
+| `anti_affinity` | P0 | With `replicas > 1`, is there a `Spread` preference or `max_replicas_per_node`? |
+| `resource_reservations` | P1 | Are CPU+RAM reservations set so the scheduler can plan? |
+| `single_replica_risk` | P1 | Is `replicas == 1` for a non-singleton service? (label `singleton=true` or name pattern matches DBs / etcd / leader exempts) |
+| `resource_limits` | P2 | Are CPU+RAM limits set so a runaway service can't starve the node? |
+| `restart_policy` | P2 | Is `RestartPolicy.Condition` `any`/`on-failure` (not `none`)? |
+| `image_pinning` | P2 | Is the image anchored to a versioned tag or sha256 digest? `:latest` / `:main` / `:dev` fail. |
+| `healthcheck` | P3 | Does the container have a `Healthcheck.Test`? |
+| `update_rollback` | P3 | Is `UpdateConfig.FailureAction == rollback`? |
+| `update_parallelism` | P3 | Is `parallelism < replicas` and `order == start-first`? |
+
+Grading rubric:
+- **F** — at least one P0 fail
+- **D** — 0 P0 fails, ≥3 P1 fails
+- **C** — 0 P0 fails, ≤2 P1 fails
+- **B** — 0 P0 fails, ≤1 P1 fail, ≤2 P2 fails
+- **A** — 0 P0 fails, 0 P1 fails, ≤1 P2 fail (P3 doesn't gate)
+
+Cluster grade = floor of the average of per-service ranks.
+
+### Added — UI tab `Auditoría`
+
+Cluster-grade badge + per-service table sorted worst-first. Each row
+expands inline to show the 10 findings with a status badge (OK / Atención
+/ Falla / N/A) and — when failing — a copy-pasteable fix hint (compose
+snippet or `docker service` command). Filters: search by stack, only
+non-A grades, only F-grade. "Worst offenders" panel jumps directly to the
+expanded row.
+
+### Added — API endpoints
+
+- `GET /api/plugins/docker_swarm/api/policy/audit`
+  - Optional `?service=<name>` — single-service audit
+  - Cached for 8 s (same TTL as the rest of the cache)
+  - No mutations, no admin gate (audit is observational, viewable by
+    any user with `plugins.view`)
+
+- `GET /api/plugins/docker_swarm/api/policy/checks`
+  - Returns the catalog of checks + severity legend + grade rubric.
+    Used by the UI for tooltips and external tools that want to discover
+    the contract.
+
+### Internal — _fetch_services captures additional spec fields
+
+The audit runs over data already in the cache; the only fetcher change
+is to populate previously-discarded fields:
+
+- `placement_preferences`, `placement_max_replicas`
+- `restart_policy`, `healthcheck`
+- `update_config`, `rollback_config`
+
+Adds zero SSH calls — these were already in the inspect payload.
+
+### Why this matters
+
+Before this release, the plugin was a viewer + a few sharp action verbs
+(scale, restart, rebalance). The Balance feature scored *result* (where
+tasks landed) without ever telling you whether the *spec* would let
+Swarm balance correctly in the first place. The auditor closes that gap:
+it grades the spec — the only thing that's truly under your control —
+and tells you what to change. Phase 2 (1.12.x) will optionally apply
+the suggested fixes with rollback. Phase 3 will add resource-pressure
+history so balance can mean more than "even task counts".
+
+---
+
 ## [1.10.0] — 2026-05-02
 
 Major performance pass + first new feature since the security work. Backwards

@@ -527,13 +527,14 @@ def _fetch_services():
             task_tmpl = spec.get('TaskTemplate', {})
             container_spec = task_tmpl.get('ContainerSpec', {})
             resources_spec = task_tmpl.get('Resources', {})
+            placement = task_tmpl.get('Placement', {})
             endpoint = inspect.get('Endpoint', {})
             mode = spec.get('Mode', {})
 
             svc['image_full'] = container_spec.get('Image', '')
             svc['env'] = len(container_spec.get('Env', []))
             svc['mounts'] = len(container_spec.get('Mounts', []))
-            svc['constraints'] = task_tmpl.get('Placement', {}).get('Constraints', [])
+            svc['constraints'] = placement.get('Constraints', [])
             svc['labels'] = spec.get('Labels', {})
             svc['ports_detail'] = endpoint.get('Ports', [])
             svc['vip'] = [v.get('Addr', '') for v in endpoint.get('VirtualIPs', [])]
@@ -542,6 +543,13 @@ def _fetch_services():
             svc['created'] = inspect.get('CreatedAt', '')
             svc['updated'] = inspect.get('UpdatedAt', '')
             svc['update_status'] = inspect.get('UpdateStatus', {})
+            # Audit fields (v1.11.0 — Policy Auditor)
+            svc['placement_preferences'] = placement.get('Preferences', []) or []
+            svc['placement_max_replicas'] = placement.get('MaxReplicas', 0) or 0
+            svc['restart_policy'] = task_tmpl.get('RestartPolicy', {}) or {}
+            svc['healthcheck'] = container_spec.get('Healthcheck', {}) or {}
+            svc['update_config'] = spec.get('UpdateConfig', {}) or {}
+            svc['rollback_config'] = spec.get('RollbackConfig', {}) or {}
 
             if 'Replicated' in mode:
                 svc['mode_type'] = 'replicated'
@@ -804,6 +812,489 @@ def _bg_poll():
             log.error(f"[{PLUGIN_ID}] Auto-prune tick error: {e}")
 
         _bg_stop.wait(interval)
+
+
+# ---------------------------------------------------------------------------
+# Policy Auditor (v1.11.0 — Phase 1)
+# ---------------------------------------------------------------------------
+# Audits each Swarm service against best-practice policies and grades A-F.
+# Read-only: never mutates services. The auditor surfaces findings; humans (or
+# a future Applier in Phase 2) decide whether to apply the suggested fixes.
+#
+# Severity:
+#   P0 — critical: outage almost certain (no spread + replicas>1, replicas>nodes)
+#   P1 — important: degrades availability or scheduler quality
+#   P2 — recommended: best practices that prevent surprises (no limits, :latest)
+#   P3 — nice to have: polish (no healthcheck, no rollback config)
+#
+# Aggregate grade per service:
+#   F — at least one P0 fail
+#   D — 0 P0 fails (still "running"); collects ≥3 P1 fails
+#   C — 0 P0 fails, ≤2 P1 fails
+#   B — 0 P0 fails, ≤1 P1 fail, ≤2 P2 fails
+#   A — 0 P0 fails, 0 P1 fails, ≤1 P2 fail (P3 doesn't gate the grade)
+
+POLICY_CHECKS = [
+    {
+        'id': 'replicas_vs_nodes',
+        'severity': 'P0',
+        'title': 'Réplicas no exceden nodos sanos',
+        'description': 'replicas > nodos sanos significa que algunas réplicas nunca se schedulearán.',
+    },
+    {
+        'id': 'anti_affinity',
+        'severity': 'P0',
+        'title': 'Anti-afinidad configurada para multi-réplica',
+        'description': 'Con replicas>1, sin spread ni max_replicas_per_node todas pueden caer en un solo nodo.',
+    },
+    {
+        'id': 'resource_reservations',
+        'severity': 'P1',
+        'title': 'Reservations de CPU y memoria definidas',
+        'description': 'Sin reservations el scheduler no puede planificar capacidad — colocaciones a ciegas.',
+    },
+    {
+        'id': 'single_replica_risk',
+        'severity': 'P1',
+        'title': 'Servicio replicated con >1 réplica para HA',
+        'description': 'Una sola réplica = downtime durante updates/fallos. Aceptable solo para singletons.',
+    },
+    {
+        'id': 'resource_limits',
+        'severity': 'P2',
+        'title': 'Limits de CPU y memoria definidas',
+        'description': 'Sin limits un servicio puede consumir un nodo entero y matar a sus vecinos.',
+    },
+    {
+        'id': 'restart_policy',
+        'severity': 'P2',
+        'title': 'Política de restart distinta a none',
+        'description': 'Restart=none deja al servicio caído ante cualquier fallo transitorio.',
+    },
+    {
+        'id': 'image_pinning',
+        'severity': 'P2',
+        'title': 'Imagen anclada (no :latest sin digest)',
+        'description': ':latest es mutable — un docker pull asincrónico puede romperte el rolling update.',
+    },
+    {
+        'id': 'healthcheck',
+        'severity': 'P3',
+        'title': 'Healthcheck definido',
+        'description': 'Sin healthcheck Swarm no detecta degradación parcial — solo crashes duros.',
+    },
+    {
+        'id': 'update_rollback',
+        'severity': 'P3',
+        'title': 'Auto-rollback en updates',
+        'description': 'update_config.failure_action=rollback evita que un mal deploy te deje caído.',
+    },
+    {
+        'id': 'update_parallelism',
+        'severity': 'P3',
+        'title': 'update_config.parallelism explícito',
+        'description': 'parallelism=1 (con orden start-first) garantiza que siempre hay réplicas vivas durante el update.',
+    },
+]
+
+# Heurística para detectar singletons donde replicas=1 es legítimo:
+#   - DBs primary (postgres/patroni con role=primary), redis sentinel master, etcd leader
+#   - El usuario marcó label `singleton=true` o nombre matchea patrones clásicos.
+_SINGLETON_NAME_PATTERNS = re.compile(
+    r'(patroni\d+|postgres|mysql|mariadb|etcd\d+|sentinel|leader|primary|master)$',
+    re.IGNORECASE,
+)
+
+def _is_singleton_service(svc):
+    """Best-effort: si parece un singleton (DB primary, etcd leader, etc.) no penalizar replicas=1."""
+    labels = svc.get('labels', {}) or {}
+    if str(labels.get('singleton', '')).lower() in ('true', '1', 'yes'):
+        return True
+    name = svc.get('Name', '') or ''
+    return bool(_SINGLETON_NAME_PATTERNS.search(name))
+
+
+def _has_spread(svc):
+    """Has any placement.preferences entry of type Spread (over node.id, hostname, etc.)."""
+    prefs = svc.get('placement_preferences', []) or []
+    for p in prefs:
+        if isinstance(p, dict) and p.get('Spread'):
+            return True
+    return False
+
+
+def _check_replicas_vs_nodes(svc, ctx):
+    if svc.get('mode_type') != 'replicated':
+        return {'status': 'skip', 'message': 'Servicio en modo global o non-replicated.'}
+    replicas = svc.get('replicas_spec', 0) or 0
+    healthy = ctx.get('healthy_nodes', 0)
+    if replicas <= 0:
+        return {'status': 'skip', 'message': 'Replicas=0 (servicio detenido).'}
+    if healthy <= 0:
+        return {'status': 'skip', 'message': 'No hay nodos sanos detectados — no se puede evaluar.'}
+    if replicas > healthy:
+        return {
+            'status': 'fail',
+            'message': f'replicas={replicas} > nodos sanos={healthy}. Algunas réplicas nunca se schedulearán.',
+            'fix_hint': f'docker service scale {svc.get("Name")}={healthy}  # o añadir nodos al cluster',
+        }
+    return {'status': 'pass', 'message': f'replicas={replicas} ≤ nodos sanos={healthy}.'}
+
+
+def _check_anti_affinity(svc, ctx):
+    if svc.get('mode_type') != 'replicated':
+        return {'status': 'skip', 'message': 'Servicio en modo global (anti-afinidad implícita).'}
+    replicas = svc.get('replicas_spec', 0) or 0
+    if replicas <= 1:
+        return {'status': 'skip', 'message': 'replicas≤1 — anti-afinidad N/A.'}
+    has_spread = _has_spread(svc)
+    max_per_node = svc.get('placement_max_replicas', 0) or 0
+    if has_spread and max_per_node:
+        return {
+            'status': 'pass',
+            'message': f'spread + max_replicas_per_node={max_per_node}.',
+        }
+    if has_spread:
+        return {
+            'status': 'pass',
+            'message': 'placement.preferences con Spread configurado.',
+        }
+    if max_per_node and max_per_node < replicas:
+        return {
+            'status': 'pass',
+            'message': f'max_replicas_per_node={max_per_node} < replicas={replicas}.',
+        }
+    return {
+        'status': 'fail',
+        'message': f'replicas={replicas} sin spread ni max_replicas_per_node — todas pueden caer en un solo nodo.',
+        'fix_hint': (
+            'Recomendado en compose: deploy.placement.preferences:\n'
+            '  - spread: node.id\n'
+            'O bien: deploy.placement.max_replicas_per_node: 1'
+        ),
+    }
+
+
+def _check_resource_reservations(svc, ctx):
+    res = svc.get('resources_reservations', {}) or {}
+    cpu = res.get('NanoCPUs', 0) or 0
+    mem = res.get('MemoryBytes', 0) or 0
+    if cpu and mem:
+        return {'status': 'pass', 'message': f'cpu={cpu/1e9:.2f}, mem={mem/(1024*1024):.0f}MiB.'}
+    if cpu or mem:
+        return {
+            'status': 'warn',
+            'message': 'Solo un recurso reservado — definí ambos para que el scheduler planifique bien.',
+            'fix_hint': 'deploy.resources.reservations: { cpus: "0.25", memory: 256M }',
+        }
+    return {
+        'status': 'fail',
+        'message': 'Sin reservations — scheduler coloca a ciegas.',
+        'fix_hint': 'deploy.resources.reservations: { cpus: "0.25", memory: 256M }',
+    }
+
+
+def _check_resource_limits(svc, ctx):
+    lim = svc.get('resources_limits', {}) or {}
+    cpu = lim.get('NanoCPUs', 0) or 0
+    mem = lim.get('MemoryBytes', 0) or 0
+    if cpu and mem:
+        return {'status': 'pass', 'message': f'cpu={cpu/1e9:.2f}, mem={mem/(1024*1024):.0f}MiB.'}
+    if cpu or mem:
+        return {
+            'status': 'warn',
+            'message': 'Solo un límite definido — definí ambos para evitar starvation cruzado.',
+            'fix_hint': 'deploy.resources.limits: { cpus: "1.0", memory: 512M }',
+        }
+    return {
+        'status': 'fail',
+        'message': 'Sin limits — un servicio mal portado puede tirar el nodo entero.',
+        'fix_hint': 'deploy.resources.limits: { cpus: "1.0", memory: 512M }',
+    }
+
+
+def _check_restart_policy(svc, ctx):
+    rp = svc.get('restart_policy', {}) or {}
+    cond = (rp.get('Condition', '') or '').lower()
+    if cond in ('any', 'on-failure'):
+        max_attempts = rp.get('MaxAttempts', 0)
+        if max_attempts and max_attempts < 3:
+            return {
+                'status': 'warn',
+                'message': f'Restart={cond} con max_attempts={max_attempts} — tolerancia muy baja.',
+                'fix_hint': 'restart_policy: { condition: any, max_attempts: 0 }  # 0 = ilimitado',
+            }
+        return {'status': 'pass', 'message': f'Restart={cond}.'}
+    if cond == 'none':
+        return {
+            'status': 'fail',
+            'message': 'Restart=none — un crash deja al servicio caído permanentemente.',
+            'fix_hint': 'restart_policy: { condition: any }',
+        }
+    return {
+        'status': 'warn',
+        'message': f'Restart condition vacía o desconocida ({cond or "none"}).',
+        'fix_hint': 'restart_policy: { condition: any }',
+    }
+
+
+def _check_image_pinning(svc, ctx):
+    img = svc.get('image_full', '') or svc.get('Image', '') or ''
+    if not img:
+        return {'status': 'skip', 'message': 'Sin imagen detectada.'}
+    has_digest = '@sha256:' in img
+    if has_digest:
+        return {'status': 'pass', 'message': 'Imagen anclada con digest sha256.'}
+    # Strip digest if present then check tag
+    tag_part = img.rsplit('@', 1)[0]
+    if ':' not in tag_part.rsplit('/', 1)[-1]:
+        return {
+            'status': 'fail',
+            'message': f'{img} sin tag — implícitamente :latest.',
+            'fix_hint': 'Usá tags inmutables (versión semver o digest sha256).',
+        }
+    tag = tag_part.rsplit(':', 1)[-1].lower()
+    if tag in ('latest', 'main', 'master', 'develop', 'dev', 'edge'):
+        return {
+            'status': 'fail',
+            'message': f'Tag mutable :{tag} — un pull puede traer una imagen distinta sin avisar.',
+            'fix_hint': 'Usá un tag versionado (v1.2.3) o digest sha256.',
+        }
+    return {'status': 'pass', 'message': f'Tag inmutable :{tag}.'}
+
+
+def _check_single_replica_risk(svc, ctx):
+    if svc.get('mode_type') != 'replicated':
+        return {'status': 'skip', 'message': 'Servicio global — no aplica.'}
+    replicas = svc.get('replicas_spec', 0) or 0
+    if replicas == 0:
+        return {'status': 'skip', 'message': 'Servicio detenido.'}
+    if replicas == 1:
+        if _is_singleton_service(svc):
+            return {
+                'status': 'pass',
+                'message': 'replicas=1 aceptable (singleton detectado por nombre/label).',
+            }
+        return {
+            'status': 'fail',
+            'message': 'replicas=1 — no hay HA. Updates causan downtime.',
+            'fix_hint': f'docker service scale {svc.get("Name")}=2  (o añadir label singleton=true si es intencional)',
+        }
+    return {'status': 'pass', 'message': f'replicas={replicas}.'}
+
+
+def _check_healthcheck(svc, ctx):
+    hc = svc.get('healthcheck', {}) or {}
+    test = hc.get('Test', []) or []
+    if not test:
+        return {
+            'status': 'fail',
+            'message': 'Sin healthcheck — Swarm solo detecta crashes, no degradación.',
+            'fix_hint': 'healthcheck: { test: ["CMD", "curl", "-f", "http://localhost/health"], interval: 30s, retries: 3 }',
+        }
+    if isinstance(test, list) and test[0] == 'NONE':
+        return {
+            'status': 'fail',
+            'message': 'Healthcheck explícitamente desactivado (NONE).',
+            'fix_hint': 'Remové "test: NONE" o reemplazá por un comando real.',
+        }
+    return {'status': 'pass', 'message': 'Healthcheck activo.'}
+
+
+def _check_update_rollback(svc, ctx):
+    uc = svc.get('update_config', {}) or {}
+    fa = (uc.get('FailureAction', '') or '').lower()
+    if fa == 'rollback':
+        return {'status': 'pass', 'message': 'failure_action=rollback.'}
+    if fa in ('continue', 'pause', ''):
+        return {
+            'status': 'fail',
+            'message': f'failure_action={fa or "default"} — un mal deploy te deja caído sin auto-rollback.',
+            'fix_hint': 'update_config: { failure_action: rollback, monitor: 30s }',
+        }
+    return {'status': 'warn', 'message': f'failure_action={fa}.'}
+
+
+def _check_update_parallelism(svc, ctx):
+    uc = svc.get('update_config', {}) or {}
+    par = uc.get('Parallelism', None)
+    order = (uc.get('Order', '') or '').lower()
+    replicas = svc.get('replicas_spec', 0) or 0
+    if par is None:
+        return {
+            'status': 'fail',
+            'message': 'parallelism no definido — Swarm usa default (1) pero implícito es frágil.',
+            'fix_hint': 'update_config: { parallelism: 1, order: start-first }',
+        }
+    if isinstance(replicas, int) and replicas >= 2 and par >= replicas:
+        return {
+            'status': 'fail',
+            'message': f'parallelism={par} ≥ replicas={replicas} — actualizás todo a la vez = downtime.',
+            'fix_hint': 'update_config: { parallelism: 1, order: start-first }',
+        }
+    if order != 'start-first':
+        return {
+            'status': 'warn',
+            'message': f'order={order or "stop-first"} — start-first prefiere disponibilidad sobre velocidad.',
+            'fix_hint': 'update_config: { order: start-first }',
+        }
+    return {'status': 'pass', 'message': f'parallelism={par}, order=start-first.'}
+
+
+_CHECK_FUNCS = {
+    'replicas_vs_nodes': _check_replicas_vs_nodes,
+    'anti_affinity': _check_anti_affinity,
+    'resource_reservations': _check_resource_reservations,
+    'single_replica_risk': _check_single_replica_risk,
+    'resource_limits': _check_resource_limits,
+    'restart_policy': _check_restart_policy,
+    'image_pinning': _check_image_pinning,
+    'healthcheck': _check_healthcheck,
+    'update_rollback': _check_update_rollback,
+    'update_parallelism': _check_update_parallelism,
+}
+
+
+def _audit_service(svc, ctx):
+    """Run every check against one service. Return findings + grade."""
+    results = []
+    for meta in POLICY_CHECKS:
+        cid = meta['id']
+        fn = _CHECK_FUNCS.get(cid)
+        if not fn:
+            continue
+        try:
+            r = fn(svc, ctx) or {}
+        except Exception as e:
+            r = {'status': 'skip', 'message': f'Error en check: {e}'}
+        results.append({
+            'id': cid,
+            'severity': meta['severity'],
+            'title': meta['title'],
+            'status': r.get('status', 'skip'),
+            'message': r.get('message', ''),
+            'fix_hint': r.get('fix_hint', ''),
+        })
+    grade = _grade_from_findings(results)
+    return {
+        'service_id': svc.get('ID', ''),
+        'service_name': svc.get('Name', ''),
+        'stack': svc.get('stack', ''),
+        'replicas_spec': svc.get('replicas_spec', 0),
+        'mode_type': svc.get('mode_type', ''),
+        'image': svc.get('image_full', ''),
+        'grade': grade,
+        'findings': results,
+        'summary': _summarize_findings(results),
+    }
+
+
+def _summarize_findings(findings):
+    counts = {'pass': 0, 'fail': 0, 'warn': 0, 'skip': 0}
+    by_sev = {'P0': 0, 'P1': 0, 'P2': 0, 'P3': 0}  # fails+warns por severidad
+    for f in findings:
+        counts[f['status']] = counts.get(f['status'], 0) + 1
+        if f['status'] in ('fail', 'warn'):
+            by_sev[f['severity']] = by_sev.get(f['severity'], 0) + 1
+    return {'by_status': counts, 'issues_by_severity': by_sev}
+
+
+def _grade_from_findings(findings):
+    p0 = p1 = p2 = 0
+    for f in findings:
+        if f['status'] != 'fail':
+            continue
+        if f['severity'] == 'P0':
+            p0 += 1
+        elif f['severity'] == 'P1':
+            p1 += 1
+        elif f['severity'] == 'P2':
+            p2 += 1
+    if p0 >= 1:
+        return 'F'
+    if p1 >= 3:
+        return 'D'
+    if p1 >= 2:
+        return 'C'
+    if p1 >= 1 or p2 >= 3:
+        return 'B' if p1 == 0 else 'C'
+    if p2 >= 2:
+        return 'B'
+    if p2 >= 1:
+        return 'B'
+    return 'A'
+
+
+_GRADE_RANK = {'A': 4, 'B': 3, 'C': 2, 'D': 1, 'F': 0}
+_RANK_GRADE = {v: k for k, v in _GRADE_RANK.items()}
+
+
+def _cluster_grade(audits):
+    if not audits:
+        return 'A', 0.0
+    ranks = [_GRADE_RANK.get(a['grade'], 0) for a in audits]
+    avg = sum(ranks) / len(ranks)
+    # Floor to letter
+    return _RANK_GRADE.get(int(avg), 'F'), round(avg, 2)
+
+
+def _run_cluster_audit(service_filter=None):
+    """Run full cluster audit. Optionally filter to a single service by name."""
+    services = _cache_get('services')
+    if services is None:
+        services = _fetch_services()
+
+    # Healthy node count (active + ready) for replicas/anti-affinity checks
+    nodes = _cache_get('nodes')
+    if nodes is None:
+        nodes = _fetch_nodes()
+    healthy = 0
+    for n in nodes or []:
+        avail = (n.get('Availability', '') or '').lower()
+        status = (n.get('Status', '') or '').lower()
+        if avail == 'active' and status == 'ready':
+            healthy += 1
+
+    ctx = {'healthy_nodes': healthy, 'total_nodes': len(nodes or [])}
+
+    audits = []
+    for svc in services or []:
+        if service_filter and svc.get('Name') != service_filter:
+            continue
+        audits.append(_audit_service(svc, ctx))
+
+    cluster_grade, avg_rank = _cluster_grade(audits)
+
+    # Distribution of grades + worst offenders
+    grade_dist = {'A': 0, 'B': 0, 'C': 0, 'D': 0, 'F': 0}
+    for a in audits:
+        grade_dist[a['grade']] = grade_dist.get(a['grade'], 0) + 1
+    worst = sorted(
+        audits,
+        key=lambda a: (
+            _GRADE_RANK.get(a['grade'], 0),
+            -a['summary']['issues_by_severity']['P0'],
+            -a['summary']['issues_by_severity']['P1'],
+        ),
+    )[:10]
+
+    return {
+        'cluster_grade': cluster_grade,
+        'avg_rank': avg_rank,
+        'healthy_nodes': healthy,
+        'total_nodes': ctx['total_nodes'],
+        'service_count': len(audits),
+        'grade_distribution': grade_dist,
+        'worst_offenders': [{
+            'service_name': a['service_name'],
+            'stack': a['stack'],
+            'grade': a['grade'],
+            'p0_issues': a['summary']['issues_by_severity']['P0'],
+            'p1_issues': a['summary']['issues_by_severity']['P1'],
+        } for a in worst if a['grade'] != 'A'],
+        'audits': audits,
+        'updated_at': datetime.now().isoformat(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2168,6 +2659,55 @@ def _api_rebalance_service():
 
 
 # ---------------------------------------------------------------------------
+# Policy Audit endpoints (v1.11.0 — Phase 1)
+# ---------------------------------------------------------------------------
+
+def _api_policy_audit():
+    """GET — Cluster-wide audit, or single service via ?service=<name>.
+
+    Read-only. Pure Python over the cached services/nodes data, so cost is
+    negligible — we still cache because dashboards poll on intervals.
+    """
+    service = request.args.get('service', '').strip()
+    if service and not _valid(_RX_DOCKER_REF, service):
+        return {'error': 'Invalid service name'}, 400
+
+    cache_key = f'audit:{service}' if service else 'audit:all'
+    cached = _cache_get(cache_key)
+    if cached:
+        return cached
+
+    try:
+        report = _run_cluster_audit(service_filter=service or None)
+    except Exception as e:
+        log.error(f"[{PLUGIN_ID}] Policy audit failed: {e}")
+        return {'error': f'Audit failed: {e}'}, 500
+
+    _cache_set(cache_key, report)
+    return report
+
+
+def _api_policy_checks():
+    """GET — Catalog of available checks (id, severity, title, description)."""
+    return {
+        'checks': POLICY_CHECKS,
+        'severity_levels': {
+            'P0': 'Crítico — outage casi seguro',
+            'P1': 'Importante — degrada disponibilidad o scheduler',
+            'P2': 'Recomendado — best practice que evita sorpresas',
+            'P3': 'Polish — nice to have',
+        },
+        'grade_thresholds': {
+            'A': '0 P0, 0 P1, ≤1 P2',
+            'B': '0 P0, ≤1 P1, ≤2 P2',
+            'C': '0 P0, ≤2 P1',
+            'D': '0 P0, ≥3 P1',
+            'F': '≥1 P0',
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # Webhooks (A4 — v1.10.0)
 # ---------------------------------------------------------------------------
 # Per-service unguessable URL that CI/CD systems POST to in order to trigger
@@ -2626,6 +3166,9 @@ def register(app):
         'network-remove': _api_network_remove,
         'load-balance': _api_load_balance,
         'rebalance-service': _api_rebalance_service,
+        # Policy Auditor (v1.11.0 — Phase 1)
+        'policy/audit': _api_policy_audit,
+        'policy/checks': _api_policy_checks,
         # Webhooks (A4 — v1.10.0)
         'webhooks': _api_webhook_list,
         'webhook-create': _api_webhook_create,

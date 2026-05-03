@@ -1685,6 +1685,196 @@ function LoadBalance({ data, toast }) {
   </div>;
 }
 
+// ============== AUDIT ==============
+
+const GRADE_COLOR = {
+  A: '#22c55e',
+  B: '#3b82f6',
+  C: '#eab308',
+  D: '#f97316',
+  F: '#ef4444',
+};
+
+const SEV_COLOR = {
+  P0: 'var(--red)',
+  P1: '#f97316',
+  P2: 'var(--yellow)',
+  P3: 'var(--blue)',
+};
+
+const STATUS_BADGE = {
+  pass: { color: 'var(--green)', bg: 'rgba(34,197,94,.15)', label: 'OK' },
+  warn: { color: 'var(--yellow)', bg: 'rgba(234,179,8,.15)', label: 'Atención' },
+  fail: { color: 'var(--red)', bg: 'rgba(239,68,68,.15)', label: 'Falla' },
+  skip: { color: 'var(--muted)', bg: 'rgba(113,113,122,.15)', label: 'N/A' },
+};
+
+function GradeBadge({ grade, size = 'md' }) {
+  const s = size === 'lg' ? { fontSize: 64, w: 84, h: 84 } : size === 'sm' ? { fontSize: 13, w: 28, h: 24 } : { fontSize: 22, w: 44, h: 36 };
+  const color = GRADE_COLOR[grade] || 'var(--muted)';
+  return <span style={{
+    display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+    width: s.w, height: s.h, borderRadius: 8, fontWeight: 800, fontSize: s.fontSize,
+    background: color + '22', color: color, border: `1px solid ${color}66`,
+  }}>{grade}</span>;
+}
+
+function Audit({ data, onRefresh, toast }) {
+  const [expanded, setExpanded] = useState(null);  // service_id of expanded row
+  const [filter, setFilter] = useState('all');     // all | non-a | f-only
+  const [stackFilter, setStackFilter] = useState('');
+
+  if (!data) return <div className="card" style={{padding:20,color:'var(--muted)'}}>Cargando auditoría…</div>;
+  if (data.error) return <div className="card" style={{padding:20,color:'var(--red)'}}>{data.error}</div>;
+
+  const { cluster_grade, avg_rank, healthy_nodes, total_nodes, service_count, grade_distribution, worst_offenders, audits } = data;
+
+  let visible = audits || [];
+  if (filter === 'non-a') visible = visible.filter(a => a.grade !== 'A');
+  if (filter === 'f-only') visible = visible.filter(a => a.grade === 'F');
+  if (stackFilter) visible = visible.filter(a => (a.stack || '').toLowerCase().includes(stackFilter.toLowerCase()));
+
+  // Sort worst-first then by name
+  visible = [...visible].sort((x, y) => {
+    const r = (GRADE_COLOR[x.grade] ? ['F','D','C','B','A'].indexOf(x.grade) : 99) -
+              (GRADE_COLOR[y.grade] ? ['F','D','C','B','A'].indexOf(y.grade) : 99);
+    if (r !== 0) return r;
+    return (x.service_name || '').localeCompare(y.service_name || '');
+  });
+
+  const totalP0 = audits.reduce((sum, a) => sum + (a.summary?.issues_by_severity?.P0 || 0), 0);
+  const totalP1 = audits.reduce((sum, a) => sum + (a.summary?.issues_by_severity?.P1 || 0), 0);
+
+  return <div>
+    {/* Top: cluster grade + summary */}
+    <div style={{display:'grid',gridTemplateColumns:'220px 1fr',gap:16,marginBottom:16}}>
+      <div className="card" style={{padding:20,textAlign:'center'}}>
+        <GradeBadge grade={cluster_grade} size="lg" />
+        <div style={{fontSize:12,color:'var(--muted)',marginTop:8}}>Calificación del cluster</div>
+        <div style={{fontSize:11,color:'var(--muted)',marginTop:4}}>promedio: {avg_rank?.toFixed?.(2) ?? avg_rank} / 4</div>
+        <div style={{fontSize:11,color:'var(--muted)',marginTop:2}}>{service_count} servicios · {healthy_nodes}/{total_nodes} nodos sanos</div>
+      </div>
+      <div className="card" style={{padding:20}}>
+        <div style={{fontSize:13,fontWeight:600,marginBottom:12}}>Distribución</div>
+        <div style={{display:'flex',gap:8,flexWrap:'wrap',marginBottom:12}}>
+          {['A','B','C','D','F'].map(g => {
+            const count = grade_distribution?.[g] || 0;
+            const pct = service_count > 0 ? Math.round((count / service_count) * 100) : 0;
+            return <div key={g} style={{
+              flex:'1 1 0', minWidth:80, padding:'8px 10px', border:'1px solid var(--border)', borderRadius:6,
+              borderLeft:`3px solid ${GRADE_COLOR[g]}`, background:'rgba(255,255,255,.02)',
+            }}>
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+                <GradeBadge grade={g} size="sm" />
+                <span style={{fontSize:18,fontWeight:700}}>{count}</span>
+              </div>
+              <div style={{fontSize:11,color:'var(--muted)',marginTop:2}}>{pct}% del total</div>
+            </div>;
+          })}
+        </div>
+        <div style={{display:'flex',gap:16,fontSize:12,color:'var(--muted)'}}>
+          <span><strong style={{color:'var(--red)'}}>{totalP0}</strong> issues P0 (críticos)</span>
+          <span><strong style={{color:'#f97316'}}>{totalP1}</strong> issues P1 (importantes)</span>
+        </div>
+      </div>
+    </div>
+
+    {worst_offenders && worst_offenders.length > 0 && <div className="card" style={{padding:16,marginBottom:16}}>
+      <div style={{fontSize:13,fontWeight:600,marginBottom:8}}>Top {worst_offenders.length} con peor calificación</div>
+      <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+        {worst_offenders.map((w, i) => <button key={i}
+          onClick={()=>{ setExpanded(w.service_name); setFilter('all'); document.getElementById('audit-row-'+w.service_name)?.scrollIntoView({behavior:'smooth',block:'center'}); }}
+          className="btn btn-sm" style={{borderColor: GRADE_COLOR[w.grade]+'66'}}>
+          <GradeBadge grade={w.grade} size="sm" />
+          {w.service_name}
+          {w.p0_issues > 0 && <span style={{color:'var(--red)',fontWeight:700}}> P0×{w.p0_issues}</span>}
+          {w.p1_issues > 0 && <span style={{color:'#f97316'}}> P1×{w.p1_issues}</span>}
+        </button>)}
+      </div>
+    </div>}
+
+    {/* Filters */}
+    <div style={{display:'flex',gap:8,marginBottom:12,alignItems:'center',flexWrap:'wrap'}}>
+      <input placeholder="Filtrar por stack…" value={stackFilter}
+        onChange={e=>setStackFilter(e.target.value)} style={{maxWidth:240}} />
+      <button className={`btn btn-sm ${filter==='all'?'btn-primary':''}`} onClick={()=>setFilter('all')}>Todos ({audits.length})</button>
+      <button className={`btn btn-sm ${filter==='non-a'?'btn-primary':''}`} onClick={()=>setFilter('non-a')}>Con issues ({audits.filter(a=>a.grade!=='A').length})</button>
+      <button className={`btn btn-sm ${filter==='f-only'?'btn-primary':''}`} onClick={()=>setFilter('f-only')}>Solo F ({audits.filter(a=>a.grade==='F').length})</button>
+      <button className="btn btn-sm" onClick={onRefresh}>Refresh</button>
+    </div>
+
+    {/* Per-service table */}
+    <div className="card" style={{padding:0,overflow:'hidden'}}>
+      <table>
+        <thead><tr>
+          <th style={{width:60}}>Grado</th>
+          <th>Servicio</th>
+          <th>Stack</th>
+          <th>Modo</th>
+          <th>Issues</th>
+          <th style={{width:70}}></th>
+        </tr></thead>
+        <tbody>
+          {visible.length === 0 && <tr><td colSpan={6} style={{textAlign:'center',color:'var(--muted)',padding:20}}>Nada que mostrar</td></tr>}
+          {visible.map(a => {
+            const isExp = expanded === a.service_name;
+            const sev = a.summary?.issues_by_severity || {};
+            return <React.Fragment key={a.service_name}>
+              <tr id={'audit-row-'+a.service_name}
+                style={{cursor:'pointer', background: isExp ? 'rgba(255,255,255,.04)' : undefined}}
+                onClick={()=>setExpanded(isExp ? null : a.service_name)}>
+                <td><GradeBadge grade={a.grade} /></td>
+                <td style={{fontWeight:500}}>{a.service_name}</td>
+                <td style={{color:'var(--muted)',fontSize:12}}>{a.stack || '—'}</td>
+                <td style={{fontSize:12}}>{a.mode_type === 'replicated' ? `replicated (${a.replicas_spec})` : a.mode_type}</td>
+                <td style={{fontSize:12}}>
+                  {sev.P0 > 0 && <span className="badge badge-red" style={{marginRight:4}}>P0×{sev.P0}</span>}
+                  {sev.P1 > 0 && <span style={{padding:'2px 8px',borderRadius:9999,fontSize:11,fontWeight:600,background:'rgba(249,115,22,.15)',color:'#f97316',marginRight:4}}>P1×{sev.P1}</span>}
+                  {sev.P2 > 0 && <span className="badge badge-yellow" style={{marginRight:4}}>P2×{sev.P2}</span>}
+                  {sev.P3 > 0 && <span className="badge badge-blue" style={{marginRight:4}}>P3×{sev.P3}</span>}
+                  {(sev.P0 + sev.P1 + sev.P2 + sev.P3) === 0 && <span className="badge badge-green">Sin issues</span>}
+                </td>
+                <td style={{textAlign:'right',color:'var(--muted)',fontSize:18}}>{isExp ? '▾' : '▸'}</td>
+              </tr>
+              {isExp && <tr><td colSpan={6} style={{padding:0,background:'rgba(0,0,0,.15)'}}>
+                <div style={{padding:'12px 20px'}}>
+                  <div style={{fontSize:11,color:'var(--muted)',marginBottom:8,fontFamily:'monospace'}}>{a.image}</div>
+                  <table style={{background:'transparent'}}>
+                    <thead><tr>
+                      <th style={{width:60}}>Sev</th>
+                      <th style={{width:100}}>Estado</th>
+                      <th>Check</th>
+                      <th>Detalle</th>
+                    </tr></thead>
+                    <tbody>
+                      {a.findings.map(f => {
+                        const sb = STATUS_BADGE[f.status] || STATUS_BADGE.skip;
+                        return <tr key={f.id}>
+                          <td><span style={{fontWeight:700,color:SEV_COLOR[f.severity]||'var(--muted)'}}>{f.severity}</span></td>
+                          <td><span style={{padding:'2px 8px',borderRadius:9999,fontSize:11,fontWeight:600,background:sb.bg,color:sb.color}}>{sb.label}</span></td>
+                          <td style={{fontWeight:500}}>{f.title}</td>
+                          <td style={{fontSize:12}}>
+                            <div style={{color:'var(--text)'}}>{f.message}</div>
+                            {f.fix_hint && f.status !== 'pass' && f.status !== 'skip' && <div style={{
+                              marginTop:6, padding:'6px 10px', background:'rgba(229,112,0,.08)',
+                              border:'1px solid rgba(229,112,0,.25)', borderRadius:6,
+                              fontFamily:'monospace', fontSize:11, color:'var(--accent)', whiteSpace:'pre-wrap',
+                            }}>{f.fix_hint}</div>}
+                          </td>
+                        </tr>;
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </td></tr>}
+            </React.Fragment>;
+          })}
+        </tbody>
+      </table>
+    </div>
+  </div>;
+}
+
 // ============== APP ==============
 
 function App() {
@@ -1699,6 +1889,7 @@ function App() {
   const [volumes, setVolumes] = useState(null);
   const [images, setImages] = useState(null);
   const [loadBalance, setLoadBalance] = useState(null);
+  const [audit, setAudit] = useState(null);
   const [loading, setLoading] = useState(false);
   const [toastMsg, setToastMsg] = useState(null);
   const [modal, setModal] = useState(null);
@@ -1726,6 +1917,7 @@ function App() {
         case 'volumes': setVolumes(await api('volumes')); break;
         case 'images': setImages(await api('images')); break;
         case 'loadbalance': setLoadBalance(await api('load-balance')); break;
+        case 'audit': setAudit(await api('policy/audit')); break;
       }
     } catch(e) { toast('Error cargando datos','error'); }
     setLoading(false);
@@ -1806,6 +1998,7 @@ function App() {
     {id:'volumes', label:'Volumenes', icon:'V'},
     {id:'images', label:'Imagenes', icon:'I'},
     {id:'loadbalance', label:'Balance', icon:'B'},
+    {id:'audit', label:'Auditoria', icon:'A'},
     {id:'settings', label:'Ajustes', icon:'*'},
   ];
 
@@ -1845,6 +2038,7 @@ function App() {
       {tab==='volumes' && <Volumes data={volumes} toast={toast} />}
       {tab==='images' && <Images data={images} toast={toast} />}
       {tab==='loadbalance' && <LoadBalance data={loadBalance} toast={toast} />}
+      {tab==='audit' && <Audit data={audit} onRefresh={()=>loadTab('audit')} toast={toast} />}
       {tab==='settings' && <Settings onSave={()=>loadTab('dashboard')} toast={toast} />}
     </div>
 
