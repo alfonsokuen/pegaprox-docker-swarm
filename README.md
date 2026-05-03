@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.12.0-blue" alt="Version"/>
+  <img src="https://img.shields.io/badge/version-1.13.0-blue" alt="Version"/>
   <img src="https://img.shields.io/badge/pegaprox-0.9.0+-orange" alt="PegaProx"/>
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License"/>
   <img src="https://img.shields.io/badge/python-3.8+-yellow" alt="Python"/>
@@ -59,6 +59,7 @@ Born from [Feature Request #152](https://github.com/PegaProx/project-pegaprox/is
 | **Images** | All images with repository, tag, ID, size |
 | **Settings** | Configure SSH hosts, test connections, set polling interval |
 | **Audit** | Grade every service A–F against 10 best-practice policies (anti-affinity, reservations, image pinning, healthcheck, …) with per-finding fix hints |
+| **Trends** | 30-day rolling history of per-node CPU/RAM/tasks. Sparklines on Balance cards + dedicated Tendencias tab with 1h/6h/24h/7d/30d windows |
 
 ## Installation
 
@@ -170,6 +171,8 @@ All endpoints prefixed with `/api/plugins/docker_swarm/api/`
 | GET | `/policy/checks` | Catalog of audit checks + severity legend + grade rubric |
 | POST | `/policy/apply` | Apply auto-fix for one (service, check_id). Body: `{service_name, check_id, confirm}`. Admin. |
 | GET | `/policy/appliers` | Catalog of which checks have a programmatic fix (4 of 10) |
+| GET | `/metrics/history?host=X&metric=cpu_percent&duration=24h` | Time-series for one (host, metric) over the window |
+| GET | `/metrics/trends?duration=24h` | Per-node summary stats (avg/max/current) over the window |
 
 ## Requirements
 

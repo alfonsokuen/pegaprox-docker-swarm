@@ -4,6 +4,79 @@ All notable changes to the PegaProx Docker Swarm plugin are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This
 project follows Semantic Versioning.
 
+## [1.13.0] — 2026-05-02
+
+Phase 3 of the durable-cluster-health story: **resource pressure history**.
+The plugin now records a per-node CPU/RAM/tasks sample every poll cycle into
+a SQLite ring buffer, and exposes a 30-day rolling window via two new
+endpoints + a "Tendencias" UI tab + sparklines on the existing Balance
+cards.
+
+### Added — Time-series metrics store
+
+A SQLite table `node_metrics(ts, host, hostname, cpu_count, cpu_percent,
+mem_used, mem_total, mem_percent, tasks_running)` lives in
+`<plugin>/state/metrics.db`. The schema is created on first write
+(idempotent). Retention is 30 days — rows older than that are pruned
+lazily, ~once every 5 minutes of writes.
+
+Sampling cost: zero new SSH calls. The sampler piggybacks on
+`_api_load_balance` which already fetches all of this data for the
+existing Balance view. We just write one row per node into the ring
+buffer at the end of each call. The background poll also calls
+`_api_load_balance()` in a new Phase 3 so samples accumulate even when
+no UI is open. Sample rate ≈ once per `poll_interval` seconds (default
+30s) per node.
+
+### Added — Endpoints
+
+- `GET /api/plugins/docker_swarm/api/metrics/history`
+  - Query: `host=<ip-or-hostname>&metric=<col>&duration=<24h|7d|...>`
+  - Whitelisted metric column (`cpu_percent`, `mem_percent`,
+    `mem_used`, `tasks_running`, `cpu_count`) — never interpolates user
+    input into SQL.
+  - Returns `{host, metric, duration_sec, count, points: [{ts, value}]}`
+- `GET /api/plugins/docker_swarm/api/metrics/trends`
+  - Query: `duration=<24h|...>`
+  - Returns per-node summary: `{host, hostname, samples, first_ts,
+    last_ts, cpu: {avg, max, current}, mem: {…}, tasks: {…}}`
+
+Both auth-gated by the standard PegaProx `plugins.view`.
+
+### Added — UI
+
+- **Sparklines** appear on each `NodeBalanceCard` in the Balance tab —
+  a small SVG line chart of CPU% and RAM% over the last 24h, color-
+  coded by current pressure level (red >80%, yellow >50%, green ≤50%).
+- **"Tendencias"** new top-level tab with one large card per node
+  showing CPU/RAM/Tasks over user-selected windows: 1h / 6h / 24h /
+  7d / 30d. Each panel shows current value + avg + max + a 280×48
+  sparkline. Footer shows total samples and oldest timestamp.
+
+### Internals
+
+- Module-level `_metrics_*` helpers in `__init__.py`. SQLite access is
+  guarded by a single `_metrics_lock` to serialize writes; reads use
+  the same lock for simplicity (with a short timeout=10s) since the
+  workload is light.
+- `_parse_duration_to_sec("24h"|"7d"|"1h30m")` accepts compact human
+  durations and caps at 30 days. Invalid input falls back to 24h.
+- The sampler is best-effort: any exception during the write is
+  logged and swallowed so a metrics outage never blocks `_api_load_
+  balance` for the UI.
+
+### Why this matters
+
+Before 1.13.0, the Balance feature could only tell you what tasks
+landed where *right now*. With 30 days of history you can see whether
+a node is trending hotter over time, whether last Tuesday's
+deployment moved CPU usage on `iaserver02` from 30% to 60%, or
+whether the post-midnight cron jobs are evening out the per-node load.
+Combined with the auditor (1.11.x) and applier (1.12.x), the plugin
+now covers **observe → audit → act** end-to-end on a single panel.
+
+---
+
 ## [1.12.0] — 2026-05-02
 
 Phase 2 of the durable-cluster-health story: the **Policy Applier**. The

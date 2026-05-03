@@ -115,6 +115,37 @@ const fmtAgo = (iso) => {
   return `${Math.floor(diff/86400)}d ago`;
 };
 
+// Sparkline — pure SVG line chart for time-series data.
+// points = [{ts, value}, ...] (ts in unix seconds, ascending)
+function Sparkline({ points, width = 120, height = 32, color = 'var(--accent)', maxValue = null, fill = true }) {
+  if (!points || points.length < 2) {
+    return <div style={{width, height, display:'flex', alignItems:'center', justifyContent:'center', fontSize:10, color:'var(--muted)', border:'1px dashed var(--border)', borderRadius:4}}>
+      sin datos
+    </div>;
+  }
+  const minTs = points[0].ts;
+  const maxTs = points[points.length - 1].ts;
+  const tsSpan = Math.max(1, maxTs - minTs);
+  const computedMax = maxValue ?? Math.max(...points.map(p => p.value || 0), 1);
+  const safeMax = Math.max(computedMax, 1);
+  const xy = points.map(p => {
+    const x = ((p.ts - minTs) / tsSpan) * (width - 4) + 2;
+    const y = height - 4 - (Math.min(p.value || 0, safeMax) / safeMax) * (height - 8);
+    return [x, y];
+  });
+  const linePath = xy.map(([x, y], i) => `${i === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`).join(' ');
+  const fillPath = `${linePath} L${xy[xy.length-1][0].toFixed(1)},${height-2} L${xy[0][0].toFixed(1)},${height-2} Z`;
+  const last = points[points.length - 1];
+  return <svg width={width} height={height} style={{display:'block'}}>
+    {fill && <path d={fillPath} fill={color} opacity={0.15} />}
+    <path d={linePath} stroke={color} strokeWidth={1.5} fill="none" />
+    <circle cx={xy[xy.length-1][0]} cy={xy[xy.length-1][1]} r={2} fill={color} />
+    <text x={width-2} y={11} textAnchor="end" fontSize="9" fill="var(--muted)">
+      {(last.value ?? 0).toFixed?.(1) ?? last.value}
+    </text>
+  </svg>;
+}
+
 // Toast
 function Toast({ msg, type, onClose }) {
   useEffect(() => { const t = setTimeout(onClose, 3000); return () => clearTimeout(t); }, []);
@@ -1564,11 +1595,16 @@ function Settings({ onSave, toast }) {
 
 // ============== LOAD BALANCE ==============
 
-function NodeBalanceCard({ node: n, maxTasks, rebalancing, onRebalance }) {
+function NodeBalanceCard({ node: n, maxTasks, rebalancing, onRebalance, history }) {
   const [expanded, setExpanded] = useState(false);
   const cpuColor = n.cpu_percent > 80 ? 'var(--red)' : n.cpu_percent > 50 ? 'var(--yellow)' : 'var(--green)';
   const memColor = n.mem_percent > 80 ? 'var(--red)' : n.mem_percent > 50 ? 'var(--yellow)' : 'var(--green)';
   const taskBarPct = (n.tasks_running / maxTasks) * 100;
+
+  // history = {cpu_percent: [{ts,value}], mem_percent: [...], tasks_running: [...]} for this node
+  const cpuHistory = history?.cpu_percent || [];
+  const memHistory = history?.mem_percent || [];
+  const taskHistory = history?.tasks_running || [];
 
   return <div className="card" style={{padding:16}}>
     <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:12}}>
@@ -1593,6 +1629,9 @@ function NodeBalanceCard({ node: n, maxTasks, rebalancing, onRebalance }) {
         <span>CPU ({n.cpu_count} cores)</span><span style={{color:cpuColor,fontWeight:600}}>{n.cpu_percent}%</span>
       </div>
       <ProgressBar percent={n.cpu_percent} color={cpuColor} />
+      {cpuHistory.length >= 2 && <div style={{marginTop:4}} title="CPU últimas 24h">
+        <Sparkline points={cpuHistory} width={280} height={28} color={cpuColor} maxValue={100} />
+      </div>}
     </div>
 
     {/* RAM */}
@@ -1601,6 +1640,9 @@ function NodeBalanceCard({ node: n, maxTasks, rebalancing, onRebalance }) {
         <span>RAM</span><span style={{color:memColor,fontWeight:600}}>{n.mem_total ? `${fmtBytes(n.mem_used)} / ${fmtBytes(n.mem_total)}` : '-'} ({n.mem_percent}%)</span>
       </div>
       <ProgressBar percent={n.mem_percent} color={memColor} />
+      {memHistory.length >= 2 && <div style={{marginTop:4}} title="RAM últimas 24h">
+        <Sparkline points={memHistory} width={280} height={28} color={memColor} maxValue={100} />
+      </div>}
     </div>
 
     {/* Services list (collapsible) */}
@@ -1624,6 +1666,33 @@ function NodeBalanceCard({ node: n, maxTasks, rebalancing, onRebalance }) {
 
 function LoadBalance({ data, toast }) {
   const [rebalancing, setRebalancing] = useState(null);
+  const [historyByHost, setHistoryByHost] = useState({});
+
+  // Fetch 24h history for each node's CPU/RAM/tasks. Done once per data-load
+  // (not per render) and merged into a {host: {metric: [points]}} map.
+  useEffect(() => {
+    if (!data?.nodes) return;
+    let cancelled = false;
+    (async () => {
+      const result = {};
+      for (const n of data.nodes) {
+        if (!n.host || n.error) continue;
+        const [cpu, mem, tasks] = await Promise.all([
+          api(`metrics/history?host=${encodeURIComponent(n.host)}&metric=cpu_percent&duration=24h`),
+          api(`metrics/history?host=${encodeURIComponent(n.host)}&metric=mem_percent&duration=24h`),
+          api(`metrics/history?host=${encodeURIComponent(n.host)}&metric=tasks_running&duration=24h`),
+        ]);
+        if (cancelled) return;
+        result[n.host] = {
+          cpu_percent: cpu?.points || [],
+          mem_percent: mem?.points || [],
+          tasks_running: tasks?.points || [],
+        };
+      }
+      if (!cancelled) setHistoryByHost(result);
+    })();
+    return () => { cancelled = true; };
+  }, [data?.updated_at]);
 
   if (!data) return <div className="card" style={{padding:20,color:'var(--muted)'}}>Sin datos de balance</div>;
   if (data.error) return <div className="card" style={{padding:20,color:'var(--red)'}}>{data.error}</div>;
@@ -1680,10 +1749,116 @@ function LoadBalance({ data, toast }) {
 
     {/* Node Cards */}
     <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fit, minmax(360px, 1fr))',gap:16}}>
-      {nodes.map((n, i) => <NodeBalanceCard key={i} node={n} maxTasks={maxTasks} rebalancing={rebalancing} onRebalance={doRebalance} />)}
+      {nodes.map((n, i) => <NodeBalanceCard key={i} node={n} maxTasks={maxTasks}
+        rebalancing={rebalancing} onRebalance={doRebalance} history={historyByHost[n.host]} />)}
     </div>
   </div>;
 }
+
+// ============== TRENDS ==============
+
+function Trends({ toast }) {
+  const [duration, setDuration] = useState('24h');
+  const [trends, setTrends] = useState(null);
+  const [historyByHost, setHistoryByHost] = useState({});
+  const [loading, setLoading] = useState(false);
+
+  const reload = useCallback(async () => {
+    setLoading(true);
+    try {
+      const t = await api(`metrics/trends?duration=${duration}`);
+      setTrends(t);
+      if (t?.nodes) {
+        const result = {};
+        for (const n of t.nodes) {
+          if (!n.host) continue;
+          const [cpu, mem, tasks] = await Promise.all([
+            api(`metrics/history?host=${encodeURIComponent(n.host)}&metric=cpu_percent&duration=${duration}`),
+            api(`metrics/history?host=${encodeURIComponent(n.host)}&metric=mem_percent&duration=${duration}`),
+            api(`metrics/history?host=${encodeURIComponent(n.host)}&metric=tasks_running&duration=${duration}`),
+          ]);
+          result[n.host] = {
+            cpu_percent: cpu?.points || [],
+            mem_percent: mem?.points || [],
+            tasks_running: tasks?.points || [],
+          };
+        }
+        setHistoryByHost(result);
+      }
+    } catch (e) { toast('Error cargando tendencias', 'error'); }
+    setLoading(false);
+  }, [duration, toast]);
+
+  useEffect(() => { reload(); }, [reload]);
+
+  if (!trends) return <div className="card" style={{padding:20,color:'var(--muted)'}}>
+    {loading ? 'Cargando…' : 'Sin datos'}
+  </div>;
+
+  const totalSamples = (trends.nodes || []).reduce((sum, n) => sum + (n.samples || 0), 0);
+  const oldestTs = Math.min(...(trends.nodes || []).map(n => n.first_ts || Infinity));
+  const oldestStr = isFinite(oldestTs) ? new Date(oldestTs * 1000).toLocaleString() : '-';
+
+  return <div>
+    {/* Duration toggle + summary */}
+    <div style={{display:'flex',gap:8,alignItems:'center',marginBottom:16,flexWrap:'wrap'}}>
+      {['1h', '6h', '24h', '7d', '30d'].map(d => <button key={d}
+        className={`btn btn-sm ${duration===d?'btn-primary':''}`}
+        onClick={()=>setDuration(d)}>{d}</button>)}
+      <button className="btn btn-sm" onClick={reload} disabled={loading}>{loading ? '...' : 'Refresh'}</button>
+      <div style={{flex:1}} />
+      <div style={{fontSize:11,color:'var(--muted)'}}>
+        {totalSamples.toLocaleString()} samples · más antiguo: {oldestStr}
+      </div>
+    </div>
+
+    {trends.nodes?.length === 0 && <div className="card" style={{padding:20,color:'var(--muted)',textAlign:'center'}}>
+      Aún no hay samples acumulados para esta ventana. El sampler escribe uno por nodo cada poll cycle (~30s).
+    </div>}
+
+    {/* One large card per node */}
+    <div style={{display:'grid',gridTemplateColumns:'1fr',gap:16}}>
+      {(trends.nodes || []).map(n => {
+        const h = historyByHost[n.host] || {};
+        const cpuColor = (n.cpu.current > 80) ? 'var(--red)' : (n.cpu.current > 50) ? 'var(--yellow)' : 'var(--green)';
+        const memColor = (n.mem.current > 80) ? 'var(--red)' : (n.mem.current > 50) ? 'var(--yellow)' : 'var(--green)';
+        return <div key={n.host} className="card" style={{padding:16}}>
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:12}}>
+            <div>
+              <div style={{fontSize:15,fontWeight:700}}>{n.hostname || n.host}</div>
+              <div style={{fontSize:11,color:'var(--muted)',fontFamily:'monospace'}}>{n.host} · {n.samples} samples</div>
+            </div>
+          </div>
+          <div style={{display:'grid',gridTemplateColumns:'repeat(3, 1fr)',gap:16}}>
+            <TrendPanel label="CPU" unit="%" current={n.cpu.current} avg={n.cpu.avg} max={n.cpu.max}
+              color={cpuColor} points={h.cpu_percent} maxValue={100} />
+            <TrendPanel label="RAM" unit="%" current={n.mem.current} avg={n.mem.avg} max={n.mem.max}
+              color={memColor} points={h.mem_percent} maxValue={100} />
+            <TrendPanel label="Tasks" unit="" current={n.tasks.current} avg={n.tasks.avg} max={n.tasks.max}
+              color="#3b82f6" points={h.tasks_running} maxValue={null} />
+          </div>
+        </div>;
+      })}
+    </div>
+  </div>;
+}
+
+function TrendPanel({ label, unit, current, avg, max, color, points, maxValue }) {
+  return <div style={{padding:'8px 12px',border:'1px solid var(--border)',borderRadius:6,background:'rgba(255,255,255,.02)'}}>
+    <div style={{display:'flex',justifyContent:'space-between',alignItems:'baseline',marginBottom:4}}>
+      <span style={{fontSize:11,color:'var(--muted)',textTransform:'uppercase'}}>{label}</span>
+      <span style={{fontSize:18,fontWeight:700,color}}>{(current ?? 0).toFixed?.(1) ?? current}{unit}</span>
+    </div>
+    <div style={{marginBottom:6}}>
+      <Sparkline points={points || []} width={280} height={48} color={color} maxValue={maxValue} />
+    </div>
+    <div style={{display:'flex',justifyContent:'space-between',fontSize:10,color:'var(--muted)'}}>
+      <span>avg: <strong style={{color:'var(--text)'}}>{(avg ?? 0).toFixed?.(1) ?? avg}{unit}</strong></span>
+      <span>max: <strong style={{color:'var(--text)'}}>{(max ?? 0).toFixed?.(1) ?? max}{unit}</strong></span>
+    </div>
+  </div>;
+}
+
 
 // ============== AUDIT ==============
 
@@ -2074,6 +2249,7 @@ function App() {
     {id:'volumes', label:'Volumenes', icon:'V'},
     {id:'images', label:'Imagenes', icon:'I'},
     {id:'loadbalance', label:'Balance', icon:'B'},
+    {id:'trends', label:'Tendencias', icon:'T'},
     {id:'audit', label:'Auditoria', icon:'A'},
     {id:'settings', label:'Ajustes', icon:'*'},
   ];
@@ -2114,6 +2290,7 @@ function App() {
       {tab==='volumes' && <Volumes data={volumes} toast={toast} />}
       {tab==='images' && <Images data={images} toast={toast} />}
       {tab==='loadbalance' && <LoadBalance data={loadBalance} toast={toast} />}
+      {tab==='trends' && <Trends toast={toast} />}
       {tab==='audit' && <Audit data={audit} onRefresh={()=>loadTab('audit')} toast={toast} />}
       {tab==='settings' && <Settings onSave={()=>loadTab('dashboard')} toast={toast} />}
     </div>

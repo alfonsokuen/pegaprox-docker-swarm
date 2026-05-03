@@ -63,6 +63,186 @@ def _invalidate(domain='services'):
 
 
 # ---------------------------------------------------------------------------
+# Metrics persistence (v1.13.0 — Phase 3)
+# ---------------------------------------------------------------------------
+# Time-series of per-node CPU/RAM/tasks samples in a SQLite ring buffer.
+# Used to power sparklines in the dashboard + the new "Tendencias" tab.
+# Sampling cost: ~zero — we piggyback on _api_load_balance which already
+# fetches all this data for the existing Balance view. We just write a row.
+
+import sqlite3 as _sqlite3
+
+METRICS_DB = os.path.join(STATE_DIR, 'metrics.db')
+METRICS_RETENTION_DAYS = 30
+_metrics_lock = threading.Lock()
+_metrics_initialized = False
+
+
+def _metrics_init_db():
+    """Create the metrics table + indexes if they don't exist. Idempotent."""
+    global _metrics_initialized
+    if _metrics_initialized:
+        return
+    with _metrics_lock:
+        if _metrics_initialized:
+            return
+        os.makedirs(STATE_DIR, exist_ok=True)
+        conn = _sqlite3.connect(METRICS_DB, timeout=10)
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS node_metrics (
+                    ts INTEGER NOT NULL,
+                    host TEXT NOT NULL,
+                    hostname TEXT NOT NULL,
+                    cpu_count INTEGER,
+                    cpu_percent REAL,
+                    mem_used INTEGER,
+                    mem_total INTEGER,
+                    mem_percent REAL,
+                    tasks_running INTEGER,
+                    PRIMARY KEY (host, ts)
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_node_metrics_ts ON node_metrics(ts DESC)")
+            conn.commit()
+        finally:
+            conn.close()
+        _metrics_initialized = True
+
+
+def _metrics_record_load_balance(load_balance_data):
+    """Persist a row per node from a /load-balance result. Called from
+    _api_load_balance after the data dict is built. No-op if no data."""
+    if not load_balance_data or 'nodes' not in load_balance_data:
+        return
+    _metrics_init_db()
+    ts = int(time.time())
+    rows = []
+    for n in load_balance_data['nodes']:
+        if n.get('error'):
+            continue
+        rows.append((
+            ts,
+            n.get('host', ''),
+            n.get('hostname', ''),
+            int(n.get('cpu_count') or 0),
+            float(n.get('cpu_percent') or 0),
+            int(n.get('mem_used') or 0),
+            int(n.get('mem_total') or 0),
+            float(n.get('mem_percent') or 0),
+            int(n.get('tasks_running') or 0),
+        ))
+    if not rows:
+        return
+    with _metrics_lock:
+        conn = _sqlite3.connect(METRICS_DB, timeout=10)
+        try:
+            conn.executemany("""
+                INSERT OR REPLACE INTO node_metrics
+                (ts, host, hostname, cpu_count, cpu_percent, mem_used, mem_total, mem_percent, tasks_running)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, rows)
+            # Prune lazily — once every ~5 min worth of samples
+            if ts % 300 < 30:
+                cutoff = ts - METRICS_RETENTION_DAYS * 86400
+                conn.execute("DELETE FROM node_metrics WHERE ts < ?", (cutoff,))
+            conn.commit()
+        except Exception as e:
+            log.error(f"[{PLUGIN_ID}] metrics write failed: {e}")
+        finally:
+            conn.close()
+
+
+_RX_DURATION = re.compile(r'(\d+)([smhd])')
+
+
+def _parse_duration_to_sec(s, default_sec=86400, max_sec=30 * 86400):
+    """Parse '24h', '7d', '30m', '1h30m' into seconds. Caps at max_sec.
+    Returns default_sec on empty/garbage input."""
+    if not s or not isinstance(s, str):
+        return default_sec
+    matches = _RX_DURATION.findall(s.strip().lower())
+    if not matches:
+        try:
+            return min(int(s), max_sec)  # raw seconds
+        except (TypeError, ValueError):
+            return default_sec
+    total = 0
+    for n, unit in matches:
+        n = int(n)
+        if unit == 's': total += n
+        elif unit == 'm': total += n * 60
+        elif unit == 'h': total += n * 3600
+        elif unit == 'd': total += n * 86400
+    return min(total, max_sec) if total > 0 else default_sec
+
+
+def _metrics_query_history(host, metric, duration_sec):
+    """Return a list of {ts, value} for one (host, metric) over the window."""
+    _metrics_init_db()
+    cutoff = int(time.time()) - duration_sec
+    # Whitelist metric column to prevent SQL injection — never interpolate user input
+    if metric not in ('cpu_percent', 'mem_percent', 'mem_used', 'tasks_running', 'cpu_count'):
+        return []
+    with _metrics_lock:
+        conn = _sqlite3.connect(METRICS_DB, timeout=10)
+        try:
+            cur = conn.execute(
+                f"SELECT ts, {metric} FROM node_metrics WHERE host = ? AND ts >= ? ORDER BY ts ASC",
+                (host, cutoff),
+            )
+            return [{'ts': r[0], 'value': r[1]} for r in cur.fetchall()]
+        finally:
+            conn.close()
+
+
+def _metrics_query_trends(duration_sec):
+    """Per-node summary stats over the window: avg/max + current sample."""
+    _metrics_init_db()
+    cutoff = int(time.time()) - duration_sec
+    with _metrics_lock:
+        conn = _sqlite3.connect(METRICS_DB, timeout=10)
+        try:
+            cur = conn.execute("""
+                SELECT host, MAX(hostname),
+                       AVG(cpu_percent), MAX(cpu_percent),
+                       AVG(mem_percent), MAX(mem_percent),
+                       AVG(tasks_running), MAX(tasks_running),
+                       COUNT(*),
+                       MIN(ts), MAX(ts)
+                FROM node_metrics
+                WHERE ts >= ?
+                GROUP BY host
+                ORDER BY MAX(hostname)
+            """, (cutoff,))
+            agg = cur.fetchall()
+            # Latest sample per host
+            cur2 = conn.execute("""
+                SELECT host, cpu_percent, mem_percent, tasks_running, ts
+                FROM node_metrics m
+                WHERE ts = (SELECT MAX(ts) FROM node_metrics WHERE host = m.host)
+            """)
+            current = {r[0]: {'cpu': r[1], 'mem': r[2], 'tasks': r[3], 'ts': r[4]} for r in cur2.fetchall()}
+        finally:
+            conn.close()
+    nodes = []
+    for r in agg:
+        host = r[0]
+        cur = current.get(host, {})
+        nodes.append({
+            'host': host,
+            'hostname': r[1],
+            'samples': r[8],
+            'first_ts': r[9],
+            'last_ts': r[10],
+            'cpu': {'avg': round(r[2] or 0, 1), 'max': round(r[3] or 0, 1), 'current': round(cur.get('cpu') or 0, 1)},
+            'mem': {'avg': round(r[4] or 0, 1), 'max': round(r[5] or 0, 1), 'current': round(cur.get('mem') or 0, 1)},
+            'tasks': {'avg': round(r[6] or 0, 1), 'max': r[7] or 0, 'current': cur.get('tasks') or 0},
+        })
+    return nodes
+
+
+# ---------------------------------------------------------------------------
 # Input validation helpers (allowlists for use in shell command interpolation)
 # ---------------------------------------------------------------------------
 
@@ -782,6 +962,14 @@ def _bg_poll_once():
         _cache_set('stacks', _fetch_stacks())
     except Exception as e:
         log.error(f"[{PLUGIN_ID}] Fetch stacks failed: {e}")
+
+    # Phase 3 — metrics sample (v1.13.0). Calls _api_load_balance for its side
+    # effect of writing one row per node into the metrics SQLite ring buffer.
+    # Runs every poll cycle so we get continuous samples even when no UI is open.
+    try:
+        _api_load_balance()
+    except Exception as e:
+        log.error(f"[{PLUGIN_ID}] Metrics sample failed: {e}")
 
 
 def _bg_poll():
@@ -2872,11 +3060,60 @@ def _api_load_balance():
                     f"({max_node['tasks_running']} vs {avg:.0f})"
                 )
 
-    return {
+    result = {
         'nodes': nodes_data,
         'total_tasks': total_tasks,
         'balance_score': balance_score,
         'recommendation': recommendation,
+        'updated_at': datetime.now().isoformat(),
+    }
+    # Persist a sample row per node — powers /metrics/history + /metrics/trends.
+    # Best-effort; never blocks the response.
+    try:
+        _metrics_record_load_balance(result)
+    except Exception as e:
+        log.error(f"[{PLUGIN_ID}] metrics piggyback failed: {e}")
+    return result
+
+
+def _api_metrics_history():
+    """GET — Time-series for one node + one metric.
+    Query: ?host=<ip>&metric=cpu_percent&duration=24h
+    """
+    host = request.args.get('host', '').strip()
+    metric = request.args.get('metric', 'cpu_percent').strip()
+    duration = request.args.get('duration', '24h').strip()
+
+    if not host:
+        return {'error': 'host required'}, 400
+    # Allow either IP or hostname. We don't have a strict IP regex, but
+    # disallow shell-meta and length-bound it.
+    if len(host) > 64 or any(c in host for c in (';', '|', '&', '`', '$', '\n', '\r', '\x00')):
+        return {'error': 'invalid host'}, 400
+    if metric not in ('cpu_percent', 'mem_percent', 'mem_used', 'tasks_running', 'cpu_count'):
+        return {'error': 'invalid metric'}, 400
+
+    duration_sec = _parse_duration_to_sec(duration)
+    points = _metrics_query_history(host, metric, duration_sec)
+    return {
+        'host': host,
+        'metric': metric,
+        'duration_sec': duration_sec,
+        'count': len(points),
+        'points': points,
+    }
+
+
+def _api_metrics_trends():
+    """GET — Summary stats per node over a window.
+    Query: ?duration=24h
+    """
+    duration = request.args.get('duration', '24h').strip()
+    duration_sec = _parse_duration_to_sec(duration)
+    nodes = _metrics_query_trends(duration_sec)
+    return {
+        'duration_sec': duration_sec,
+        'nodes': nodes,
         'updated_at': datetime.now().isoformat(),
     }
 
@@ -3408,6 +3645,9 @@ def register(app):
         'network-remove': _api_network_remove,
         'load-balance': _api_load_balance,
         'rebalance-service': _api_rebalance_service,
+        # Metrics history (v1.13.0 — Phase 3)
+        'metrics/history': _api_metrics_history,
+        'metrics/trends': _api_metrics_trends,
         # Policy Auditor (v1.11.0 — Phase 1)
         'policy/audit': _api_policy_audit,
         'policy/checks': _api_policy_checks,
