@@ -4,6 +4,60 @@ All notable changes to the PegaProx Docker Swarm plugin are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This
 project follows Semantic Versioning.
 
+## [1.9.5] — 2026-05-02
+
+Follow-up to v1.9.4 after a second-pass review. Addresses the issues caught
+during double-review.
+
+### Fixed
+
+- **Silent unmask downgrade**. `service-detail` and `stack-detail` previously
+  accepted `?unmask=1` from non-admins by silently returning masked envs +
+  no error, so the UI confirm dialog (which warned "queda registrado en el
+  audit log") was lying to non-admins. Now both endpoints return an explicit
+  HTTP 403 when a non-admin requests unmask, and the frontend toasts the
+  error. (Reported by frontend reviewer.)
+- **`stack-deploy` cleanup race**. The `trap "rm -f \"$tmpf\"" EXIT` was
+  installed AFTER `printf … | base64 -d > "$tmpf"` — if the write failed
+  (disk full, missing `base64`, etc.) the temp file leaked. Trap now runs
+  immediately after `mktemp`, so cleanup is guaranteed even when later
+  steps fail under `set -e`.
+- **State file atomicity**. `_api_stack_stop` now writes the JSON via a
+  sibling `.tmp` file + `os.replace` so concurrent `stack-stop` calls on
+  the same stack cannot leave a half-written state file (which would have
+  forced `stack-start` to fall back to `replicas=1` for every service).
+- **`refresh` and `node-stats` are now admin only**. Both triggered SSH
+  fan-outs to every Swarm host, usable as a low-grade DoS by any user with
+  `plugins.view`. `node-stats` additionally exposed CPU load, memory, disk
+  totals, and uptime — minor reconnaissance signal.
+- **`container-action` now invalidates the `overview` cache** (via
+  `_invalidate('nodes')`) so the running/stopped/paused container counts
+  update immediately on the dashboard after a start/stop/remove.
+- **Stack envs view ported to v1.9.4 hardening**. The `Variables` tab in
+  the stack detail view used the OLD client-side regex
+  (`password|secret|key|token|api_key`) and rendered server-masked `***`
+  as a literal red `***`. Now it uses the same expanded regex as the
+  service detail view, recognises server-side masking, displays bullets
+  (`••••••••`), and has the same `Mostrar reales (admin)` toggle that
+  calls `?unmask=1`. (Reported by frontend reviewer.)
+- **Masked value render**. Both env views now display `••••••••` (bullets)
+  instead of the literal `***` that came from the server. `***` was visually
+  confusing — looked like a real value or like corrupt data.
+- **`force` flag explicit-bool cast** in `service-update` (`bool(x) is True`)
+  so a string body like `{"force": "; rm -rf /"}` is unambiguously rejected
+  rather than relying on truthy-evaluation. The `--force` literal was
+  already safe; this is just defence in depth.
+
+### Internal
+
+- **Validator consolidation completed** for the few endpoints v1.9.4 missed:
+  `service-logs`, `container-logs`, `stack-logs`, `tasks`. All now use
+  `_valid(_RX_DOCKER_REF, …)` / `_valid(_RX_STACK_NAME, …)` and
+  `shlex.quote()`. The CHANGELOG of v1.9.4 claimed this was already done
+  everywhere — now it actually is.
+- `_fetch_tasks(service_id)` documents that callers must pre-validate
+  `service_id`, and quotes it defensively anyway.
+
 ## [1.9.4] — 2026-05-02
 
 Security & correctness pass. **Recommend everyone upgrade.**

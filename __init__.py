@@ -497,9 +497,9 @@ def _fetch_containers():
 
 
 def _fetch_tasks(service_id):
-    """Fetch tasks for a specific service."""
+    """Fetch tasks for a specific service. Caller MUST validate service_id."""
     tasks = _docker_json(
-        f'docker service ps {service_id} --format "{{{{json .}}}}" --no-trunc'
+        f'docker service ps {shlex.quote(service_id)} --format "{{{{json .}}}}" --no-trunc'
     ) or []
     return tasks
 
@@ -749,13 +749,16 @@ def _api_images():
 def _api_service_detail():
     """GET — Full service inspect with all config sections. ?service_id=xxx[&unmask=1]
     Sensitive env values (matching password|secret|token|key|jwt|auth|...) are masked
-    by default; admins can request the raw values via ?unmask=1 (logged for audit)."""
+    by default; admins can request the raw values via ?unmask=1 (logged for audit).
+    Non-admins requesting unmask get an explicit 403 (no silent downgrade)."""
     service_id = request.args.get('service_id', '')
     if not _valid(_RX_DOCKER_REF, service_id):
         return {'error': 'Valid service_id required'}, 400
     want_unmask = request.args.get('unmask', '').lower() in ('1', 'true', 'yes')
-    can_unmask = want_unmask and _is_admin()
-    if want_unmask and can_unmask:
+    if want_unmask and not _is_admin():
+        return {'error': 'Admin access required to unmask sensitive env values'}, 403
+    can_unmask = want_unmask
+    if can_unmask:
         log_audit(_get_username(), 'docker.service_envs_unmasked',
                   f'Viewed unmasked envs for {service_id}')
 
@@ -924,7 +927,7 @@ def _api_service_update():
             return {'error': 'replicas must be int'}, 400
         cmd_parts += ['--replicas', str(r)]
 
-    if data.get('force'):
+    if bool(data.get('force')) is True:
         cmd_parts.append('--force')
 
     for e in data.get('env_add', []) or []:
@@ -962,8 +965,8 @@ def _api_service_update():
 def _api_tasks():
     """GET — Tasks for a service. ?service_id=xxx"""
     service_id = request.args.get('service_id', '')
-    if not service_id:
-        return {'error': 'service_id required'}, 400
+    if not _valid(_RX_DOCKER_REF, service_id):
+        return {'error': 'Valid service_id required'}, 400
     tasks = _fetch_tasks(service_id)
     return {'tasks': tasks, 'service_id': service_id}
 
@@ -972,19 +975,15 @@ def _api_service_logs():
     """GET — Logs for a service. ?service_id=xxx&tail=100"""
     service_id = request.args.get('service_id', '')
     tail = request.args.get('tail', '100')
-    if not service_id:
-        return {'error': 'service_id required'}, 400
-
-    # Sanitize service_id to prevent injection
-    if not all(c.isalnum() or c in '-_.' for c in service_id):
-        return {'error': 'Invalid service_id'}, 400
+    if not _valid(_RX_DOCKER_REF, service_id):
+        return {'error': 'Valid service_id required'}, 400
 
     try:
-        tail = min(int(tail), 1000)
-    except ValueError:
+        tail = max(1, min(int(tail), 1000))
+    except (TypeError, ValueError):
         tail = 100
 
-    logs = _docker_cmd(f'docker service logs --tail {tail} --no-trunc {service_id} 2>&1')
+    logs = _docker_cmd(f'docker service logs --tail {tail} --no-trunc {shlex.quote(service_id)} 2>&1')
     return {'logs': logs or '', 'service_id': service_id, 'tail': tail}
 
 
@@ -992,18 +991,15 @@ def _api_container_logs():
     """GET — Logs for a container. ?container_id=xxx&tail=100"""
     container_id = request.args.get('container_id', '')
     tail = request.args.get('tail', '100')
-    if not container_id:
-        return {'error': 'container_id required'}, 400
-
-    if not all(c.isalnum() or c in '-_.' for c in container_id):
-        return {'error': 'Invalid container_id'}, 400
+    if not _valid(_RX_DOCKER_REF, container_id):
+        return {'error': 'Valid container_id required'}, 400
 
     try:
-        tail = min(int(tail), 1000)
-    except ValueError:
+        tail = max(1, min(int(tail), 1000))
+    except (TypeError, ValueError):
         tail = 100
 
-    logs = _docker_cmd(f'docker logs --tail {tail} {container_id} 2>&1')
+    logs = _docker_cmd(f'docker logs --tail {tail} {shlex.quote(container_id)} 2>&1')
     return {'logs': logs or '', 'container_id': container_id, 'tail': tail}
 
 
@@ -1096,7 +1092,8 @@ def _api_stack_deploy():
         return {'error': 'compose_yaml must be string ≤1MiB'}, 400
 
     # Write compose to remote via mktemp (race-free, unguessable path), deploy, cleanup.
-    # The base64 payload itself contains no shell metacharacters.
+    # The base64 payload contains no shell metacharacters; trap is installed BEFORE
+    # any write so a partial-write failure still cleans up.
     import base64
     b64 = base64.b64encode(compose.encode()).decode()
     qname = shlex.quote(stack_name)
@@ -1104,9 +1101,9 @@ def _api_stack_deploy():
     cmd = (
         f'set -e; '
         f'tmpf=$(mktemp -t pegaprox_stack.XXXXXXXX) && '
+        f'trap "rm -f \\"$tmpf\\"" EXIT && '
         f'chmod 600 "$tmpf" && '
         f'printf %s {qb64} | base64 -d > "$tmpf" && '
-        f'trap "rm -f \\"$tmpf\\"" EXIT; '
         f'docker stack deploy -c "$tmpf" {qname}'
     )
     result = _docker_cmd(cmd)
@@ -1119,13 +1116,15 @@ def _api_stack_deploy():
 
 def _api_stack_detail():
     """GET — Detailed info for a stack. ?name=xxx[&unmask=1]
-    Env vars masked unless admin requests unmask."""
+    Env vars masked unless admin requests unmask. Non-admins get 403 on unmask."""
     name = request.args.get('name', '')
     if not _valid(_RX_STACK_NAME, name):
         return {'error': 'Valid stack name required'}, 400
     want_unmask = request.args.get('unmask', '').lower() in ('1', 'true', 'yes')
-    can_unmask = want_unmask and _is_admin()
-    if want_unmask and can_unmask:
+    if want_unmask and not _is_admin():
+        return {'error': 'Admin access required to unmask sensitive env values'}, 403
+    can_unmask = want_unmask
+    if can_unmask:
         log_audit(_get_username(), 'docker.stack_envs_unmasked',
                   f'Viewed unmasked envs for stack {name}')
 
@@ -1296,23 +1295,25 @@ def _api_stack_logs():
     """GET — Aggregated logs from all services in a stack. ?name=xxx&tail=50"""
     name = request.args.get('name', '')
     tail = request.args.get('tail', '50')
-    if not name or not all(c.isalnum() or c in '-_' for c in name):
+    if not _valid(_RX_STACK_NAME, name):
         return {'error': 'Valid stack name required'}, 400
 
     try:
-        tail = min(int(tail), 500)
-    except ValueError:
+        tail = max(1, min(int(tail), 500))
+    except (TypeError, ValueError):
         tail = 50
 
     # Get services in this stack
     services = _docker_json(
-        f'docker service ls --filter label=com.docker.stack.namespace={name} --format "{{{{json .}}}}"'
+        f'docker service ls --filter label=com.docker.stack.namespace={shlex.quote(name)} --format "{{{{json .}}}}"'
     ) or []
 
     all_logs = []
     for svc in services:
         svc_name = svc.get('Name', '')
-        logs = _docker_cmd(f'docker service logs --tail {tail} --no-trunc {svc_name} 2>&1')
+        if not _valid(_RX_DOCKER_REF, svc_name):
+            continue
+        logs = _docker_cmd(f'docker service logs --tail {tail} --no-trunc {shlex.quote(svc_name)} 2>&1')
         if logs:
             all_logs.append(f'=== {svc_name} ===\n{logs}')
 
@@ -1356,14 +1357,19 @@ def _api_stack_stop():
             if result is not None:
                 scaled += 1
 
-    # Save replica counts LOCALLY in the plugin state dir (not in /tmp on remote)
+    # Save replica counts LOCALLY in the plugin state dir (not in /tmp on remote).
+    # Atomic write: serialize to a sibling .tmp file then os.replace into place so
+    # concurrent stack-stop calls cannot leave a half-written JSON behind.
     try:
-        with open(_stack_state_path(stack_name), 'w') as f:
+        target = _stack_state_path(stack_name)
+        tmp = target + '.tmp'
+        with open(tmp, 'w') as f:
             json.dump({'saved_at': datetime.now().isoformat(), 'replicas': saved_replicas}, f)
         try:
-            os.chmod(_stack_state_path(stack_name), 0o600)
+            os.chmod(tmp, 0o600)
         except Exception:
             pass
+        os.replace(tmp, target)
     except Exception as e:
         log.warning(f"[{PLUGIN_ID}] could not persist stack state: {e}")
 
@@ -1483,6 +1489,8 @@ def _api_container_action():
     if result is not None:
         log_audit(_get_username(), f'docker.container_{action}',
                   f'{action} container {container_id}')
+        # Container counts in overview drift after start/stop/remove
+        _invalidate('nodes')  # also drops 'overview'
         return {'success': True, 'message': f'Container {container_id} {action}ed'}
     return {'error': f'{action} failed'}, 500
 
@@ -1789,14 +1797,22 @@ def _api_topology():
 
 
 def _api_refresh():
-    """POST — Force refresh all cached data."""
+    """POST — Force refresh all cached data (admin only — triggers SSH fan-out)."""
+    err = _require_admin()
+    if err:
+        return err
     with _cache_lock:
         _cache.clear()
     return {'success': True, 'message': 'Cache cleared, next request will fetch fresh data'}
 
 
 def _api_node_stats():
-    """GET — Get resource stats for each node (CPU/RAM via SSH)."""
+    """GET — Get resource stats for each node (CPU/RAM via SSH).
+    Admin only: exposes infra detail (load avg, mem totals, disk, uptime) that's
+    useful for reconnaissance and triggers an SSH fan-out per call."""
+    err = _require_admin()
+    if err:
+        return err
     cfg = _load_config()
     hosts = cfg.get('swarm_hosts', [])
     if not hosts:

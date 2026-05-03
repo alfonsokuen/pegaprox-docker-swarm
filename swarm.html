@@ -648,8 +648,8 @@ function ServiceDetail({ serviceId, onBack, toast }) {
             </div>
           </div>
           {(svc.env||[]).length ? <div style={{background:'var(--bg)',borderRadius:6,padding:8,fontFamily:'monospace',fontSize:12,maxHeight:400,overflow:'auto'}}>
-            {svc.env.map((e,i)=>{const [k,...v]=e.split('=');const val=v.join('=');const sensitive=/password|secret|token|apikey|api_key|jwt|bearer|auth|private|credential|dsn|passwd|passphrase/i.test(k);const serverMasked=val==='***';
-              return <div key={i} style={{padding:'3px 0',borderBottom:'1px solid var(--border)'}}><span style={{color:'var(--blue)'}}>{k}</span>=<span style={{color:sensitive||serverMasked?'var(--red)':'var(--green)'}}>{val}</span></div>;})}
+            {svc.env.map((e,i)=>{const [k,...v]=e.split('=');const val=v.join('=');const sensitive=/password|secret|token|apikey|api_key|jwt|bearer|auth|private|credential|dsn|passwd|passphrase/i.test(k);const serverMasked=val==='***';const display=serverMasked?'••••••••':val;
+              return <div key={i} style={{padding:'3px 0',borderBottom:'1px solid var(--border)'}}><span style={{color:'var(--blue)'}}>{k}</span>=<span style={{color:sensitive||serverMasked?'var(--red)':'var(--green)'}}>{display}</span></div>;})}
           </div> : <div style={{color:'var(--muted)'}}>No hay variables de entorno</div>}
         </div>}
 
@@ -883,12 +883,27 @@ function Stacks({ data, onRemove, toast }) {
   const [deployName, setDeployName] = useState('');
   const [deployYaml, setDeployYaml] = useState('');
   const [deploying, setDeploying] = useState(false);
+  const [stackUnmasked, setStackUnmasked] = useState(false);
 
-  const selectStack = async (name) => {
-    setSelected(name); setActiveView('services'); setDetail(null); setCompose(null); setStackLogs(null);
+  const selectStack = async (name, opts = {}) => {
+    if (!opts._keep) { setSelected(name); setActiveView('services'); setStackUnmasked(false); }
+    setDetail(null); setCompose(null); setStackLogs(null);
     setDetailLoading(true);
-    const d = await api(`stack-detail?name=${encodeURIComponent(name)}`);
+    const q = opts.unmask ? '&unmask=1' : '';
+    const d = await api(`stack-detail?name=${encodeURIComponent(name)}${q}`);
+    if (d._http === 403) {
+      toast(d.error || 'Acceso denegado', 'error');
+      setStackUnmasked(false);
+    } else {
+      setStackUnmasked(!!opts.unmask);
+    }
     setDetail(d); setDetailLoading(false);
+  };
+
+  const toggleStackUnmask = async () => {
+    if (stackUnmasked) { setStackUnmasked(false); selectStack(selected, { _keep: true }); return; }
+    if (!confirm('Mostrar valores reales de variables sensibles? Requiere admin y queda registrado en el audit log.')) return;
+    selectStack(selected, { _keep: true, unmask: true });
   };
 
   const loadCompose = async () => {
@@ -1004,7 +1019,15 @@ function Stacks({ data, onRemove, toast }) {
       </div>}
 
       {activeView==='env' && <div className="card fade-in">
-        <h4 style={{fontSize:13,color:'var(--muted)',marginBottom:12}}>Variables de entorno por servicio</h4>
+        <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:12}}>
+          <h4 style={{fontSize:13,color:'var(--muted)',margin:0}}>Variables de entorno por servicio</h4>
+          <div style={{display:'flex',alignItems:'center',gap:8}}>
+            {svcs.some(s=>s.env_masked) && <span style={{fontSize:11,color:'var(--muted)'}}>Valores sensibles ocultos</span>}
+            <button className="btn btn-sm" onClick={toggleStackUnmask}>
+              {stackUnmasked ? 'Ocultar' : 'Mostrar reales (admin)'}
+            </button>
+          </div>
+        </div>
         {svcs.map((s,i) => {
           const envVars = s.env_vars || [];
           if (!envVars.length) return null;
@@ -1014,9 +1037,11 @@ function Stacks({ data, onRemove, toast }) {
               {envVars.map((e,j)=>{
                 const [k,...v]=e.split('=');
                 const val=v.join('=');
-                const isSensitive=/password|secret|key|token|api_key/i.test(k);
+                const isSensitive=/password|secret|token|apikey|api_key|jwt|bearer|auth|private|credential|dsn|passwd|passphrase/i.test(k);
+                const serverMasked=val==='***';
+                const display = serverMasked ? '••••••••' : val;
                 return <div key={j} style={{padding:'2px 0',borderBottom:'1px solid var(--border)'}}>
-                  <span style={{color:'var(--blue)'}}>{k}</span>=<span style={{color:isSensitive?'var(--red)':'var(--green)'}}>{isSensitive?'••••••••':val}</span>
+                  <span style={{color:'var(--blue)'}}>{k}</span>=<span style={{color:(isSensitive||serverMasked)?'var(--red)':'var(--green)'}}>{display}</span>
                 </div>;
               })}
             </div>
