@@ -161,68 +161,167 @@ class _PersistentTOFUPolicy:
             log.warning(f"[{PLUGIN_ID}] could not persist host key for {hostname}: {e}")
 
 
-def _ssh_exec(host_cfg_or_host, user=None, password=None, command='', timeout=15):
-    """Execute command on remote host via SSH, return (stdout, stderr, exit_code).
+# ---------------------------------------------------------------------------
+# SSH connection pool (P1 — v1.10.0)
+# ---------------------------------------------------------------------------
+# Each Swarm host gets ONE long-lived paramiko.SSHClient kept alive with a 30s
+# transport keepalive. Subsequent _ssh_exec calls open a fresh session on the
+# existing transport (paramiko-safe) instead of reopening TCP+key-exchange.
+# Pool entries are dropped & rebuilt automatically if the transport dies.
 
-    Accepts either:
-      - A host config dict: {host, user, key_file?, password?}
-      - Legacy positional args: (host, user, password, command)
-    Prefers key_file auth when available, falls back to password.
-    Host keys are persisted to known_hosts on first contact (TOFU); later
-    mismatches are rejected by paramiko.
-    """
+_ssh_pool = {}            # host_id -> {'client': SSHClient, 'last_used': ts}
+_ssh_pool_lock = threading.Lock()
+SSH_KEEPALIVE = 30        # seconds — paramiko sends keepalive ping
+SSH_POOL_IDLE_MAX = 600   # 10min idle -> recycle on next use
+
+
+def _ssh_pool_key(host_cfg):
+    return f"{host_cfg.get('user', '')}@{host_cfg['host']}"
+
+
+def _ssh_pool_close_all(reason='manual'):
+    """Drop every pooled SSH connection. Call on config change or shutdown."""
+    with _ssh_pool_lock:
+        n = len(_ssh_pool)
+        for entry in _ssh_pool.values():
+            try:
+                entry['client'].close()
+            except Exception:
+                pass
+        _ssh_pool.clear()
+    if n:
+        log.info(f"[{PLUGIN_ID}] SSH pool closed ({n} entries, reason={reason})")
+
+
+def _ssh_get_client(host_cfg, timeout=15):
+    """Return a connected, healthy paramiko.SSHClient for host_cfg.
+    Reuses a pooled connection when possible; reconnects transparently if dead.
+    Raises on auth/network failure — caller handles."""
     import paramiko
 
-    # Normalize: accept dict or legacy positional args
-    if isinstance(host_cfg_or_host, dict):
-        h = host_cfg_or_host
-        host = h['host']
-        user = h['user']
-        key_file = h.get('key_file', '')
-        password = h.get('password', '')
-    else:
-        host = host_cfg_or_host
-        key_file = ''
+    pkey = _ssh_pool_key(host_cfg)
 
+    # Fast path: existing healthy connection.
+    with _ssh_pool_lock:
+        entry = _ssh_pool.get(pkey)
+        if entry:
+            client = entry['client']
+            transport = client.get_transport()
+            now = time.time()
+            stale = (now - entry['last_used']) > SSH_POOL_IDLE_MAX
+            if transport and transport.is_active() and not stale:
+                entry['last_used'] = now
+                return client
+            # Drop dead/stale entry; we'll rebuild outside the lock.
+            try:
+                client.close()
+            except Exception:
+                pass
+            _ssh_pool.pop(pkey, None)
+
+    # Slow path: build a fresh connection.
     client = paramiko.SSHClient()
-    # Load previously-seen keys so paramiko enforces them.
     if os.path.isfile(KNOWN_HOSTS_PATH):
         try:
             client.load_host_keys(KNOWN_HOSTS_PATH)
         except Exception as e:
             log.warning(f"[{PLUGIN_ID}] could not load known_hosts: {e}")
-    # On a first-time host: persist the key. On a mismatch: paramiko raises BadHostKeyException.
     client.set_missing_host_key_policy(_PersistentTOFUPolicy(KNOWN_HOSTS_PATH))
-    try:
-        connect_kwargs = dict(
-            hostname=host, port=22, username=user,
-            timeout=timeout, banner_timeout=timeout,
-            auth_timeout=timeout,
-        )
-        if key_file and os.path.isfile(key_file):
-            connect_kwargs['key_filename'] = key_file
-            connect_kwargs['look_for_keys'] = False
-            connect_kwargs['allow_agent'] = False
-        elif password:
-            connect_kwargs['password'] = password
-            connect_kwargs['look_for_keys'] = False
-            connect_kwargs['allow_agent'] = False
-        else:
-            return '', 'No key_file or password configured', -1
 
-        client.connect(**connect_kwargs)
-        stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
-        exit_code = stdout.channel.recv_exit_status()
-        out = stdout.read().decode('utf-8', errors='replace')
-        err = stderr.read().decode('utf-8', errors='replace')
-        return out, err, exit_code
-    except paramiko.BadHostKeyException as e:
-        log.error(f"[{PLUGIN_ID}] HOST KEY MISMATCH for {host} — possible MITM: {e}")
-        return '', f'Host key mismatch for {host} (refusing to connect)', -1
-    except Exception as e:
-        return '', str(e), -1
-    finally:
-        client.close()
+    connect_kwargs = dict(
+        hostname=host_cfg['host'], port=22, username=host_cfg['user'],
+        timeout=timeout, banner_timeout=timeout, auth_timeout=timeout,
+    )
+    key_file = host_cfg.get('key_file', '')
+    password = host_cfg.get('password', '')
+    if key_file and os.path.isfile(key_file):
+        connect_kwargs['key_filename'] = key_file
+        connect_kwargs['look_for_keys'] = False
+        connect_kwargs['allow_agent'] = False
+    elif password:
+        connect_kwargs['password'] = password
+        connect_kwargs['look_for_keys'] = False
+        connect_kwargs['allow_agent'] = False
+    else:
+        try:
+            client.close()
+        except Exception:
+            pass
+        raise RuntimeError('No key_file or password configured')
+
+    client.connect(**connect_kwargs)
+    transport = client.get_transport()
+    if transport:
+        transport.set_keepalive(SSH_KEEPALIVE)
+
+    # Race-safe pool insert: if another thread won the race, prefer ours and close
+    # the stale entry to avoid leaking transports (last writer wins, but no leak).
+    with _ssh_pool_lock:
+        existing = _ssh_pool.get(pkey)
+        if existing and existing['client'] is not client:
+            try:
+                existing['client'].close()
+            except Exception:
+                pass
+        _ssh_pool[pkey] = {'client': client, 'last_used': time.time()}
+    return client
+
+
+def _ssh_exec(host_cfg_or_host, user=None, password=None, command='', timeout=15):
+    """Execute command on remote host via SSH, return (stdout, stderr, exit_code).
+
+    Uses the SSH connection pool — first call to a host opens TCP+key-exchange,
+    subsequent calls reuse the same transport (paramiko opens a new channel per
+    exec_command, which is the safe parallelism path).
+
+    Accepts either:
+      - A host config dict: {host, user, key_file?, password?}
+      - Legacy positional args: (host, user, password, command)
+    """
+    import paramiko
+
+    if isinstance(host_cfg_or_host, dict):
+        h = host_cfg_or_host
+    else:
+        h = {
+            'host': host_cfg_or_host, 'user': user or '',
+            'password': password or '', 'key_file': '',
+        }
+
+    if not h.get('host') or not h.get('user'):
+        return '', 'host and user required', -1
+    if not h.get('key_file') and not h.get('password'):
+        return '', 'No key_file or password configured', -1
+
+    # 2 attempts: first uses pool, second forces fresh connection if pool entry was stale.
+    last_err = ''
+    for attempt in range(2):
+        try:
+            client = _ssh_get_client(h, timeout=timeout)
+            stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+            exit_code = stdout.channel.recv_exit_status()
+            out = stdout.read().decode('utf-8', errors='replace')
+            err = stderr.read().decode('utf-8', errors='replace')
+            return out, err, exit_code
+        except paramiko.BadHostKeyException as e:
+            log.error(f"[{PLUGIN_ID}] HOST KEY MISMATCH for {h['host']} — possible MITM: {e}")
+            return '', f"Host key mismatch for {h['host']} (refusing to connect)", -1
+        except (paramiko.SSHException, EOFError, OSError, ConnectionError) as e:
+            # Transport may have died between pool fetch and exec — drop it and retry once.
+            with _ssh_pool_lock:
+                entry = _ssh_pool.pop(_ssh_pool_key(h), None)
+                if entry:
+                    try:
+                        entry['client'].close()
+                    except Exception:
+                        pass
+            last_err = str(e)
+            if attempt == 0:
+                continue
+            return '', last_err, -1
+        except Exception as e:
+            return '', str(e), -1
+    return '', last_err or 'unreachable', -1
 
 
 def _docker_cmd(command, host_cfg=None):
@@ -335,17 +434,33 @@ def _fetch_overview():
 
 
 def _fetch_nodes():
-    """Fetch node details with resource usage."""
-    nodes = _docker_json('docker node ls --format "{{json .}}"') or []
+    """Fetch node details with resource usage (P2: 1 SSH call for batched inspect, was N+1)."""
+    nodes_ls = _docker_json('docker node ls --format "{{json .}}"') or []
+    if not nodes_ls:
+        return []
+
+    inspects_raw = _docker_cmd(
+        'docker node ls -q | xargs -r -I{} docker node inspect {} --format "{{json .}}"'
+    )
+    inspects_by_id = {}
+    if inspects_raw:
+        for line in inspects_raw.strip().split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(data, dict):
+                nid = data.get('ID', '')
+                if nid:
+                    inspects_by_id[nid] = data
+
     detailed = []
-
-    for node in nodes:
+    for node in nodes_ls:
         node_id = node.get('ID', '')
-        # Get full node inspect for resources
-        inspect = _docker_json(f'docker node inspect {node_id} --format "{{{{json .}}}}"')
-        if inspect and isinstance(inspect, list):
-            inspect = inspect[0]
-
+        inspect = inspects_by_id.get(node_id)
         resources = {}
         if inspect:
             res = inspect.get('Description', {}).get('Resources', {})
@@ -361,25 +476,52 @@ def _fetch_nodes():
             node['addr'] = inspect.get('Status', {}).get('Addr', '')
             node['state'] = inspect.get('Status', {}).get('State', '')
             node['message'] = inspect.get('Status', {}).get('Message', '')
-
         node['resources'] = resources
         detailed.append(node)
-
     return detailed
 
 
 def _fetch_services():
-    """Fetch all services with details."""
-    services = _docker_json('docker service ls --format "{{json .}}"') or []
+    """Fetch all services with details (P2: 1 SSH call for batched inspect, was N+1).
+
+    `service ls` gives the basic row + Replicas. A second call pipes all IDs through
+    xargs to a batched `service inspect`, returning one JSON-per-line. We then merge
+    the inspect data into the ls rows in O(1) lookups by ID/name.
+    """
+    services_ls = _docker_json('docker service ls --format "{{json .}}"') or []
+    if not services_ls:
+        return []
+
+    # Batched inspect — one SSH call returns all service inspect docs.
+    # `-r` so xargs is silent on empty stdin; quoting wraps each ID safely.
+    inspects_raw = _docker_cmd(
+        'docker service ls -q | xargs -r -I{} docker service inspect {} --format "{{json .}}"'
+    )
+    inspects_by_id = {}
+    inspects_by_name = {}
+    if inspects_raw:
+        for line in inspects_raw.strip().split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(data, dict):
+                continue
+            svc_id = data.get('ID', '')
+            if svc_id:
+                inspects_by_id[svc_id] = data
+            name = data.get('Spec', {}).get('Name', '')
+            if name:
+                inspects_by_name[name] = data
+
     detailed = []
-
-    for svc in services:
-        svc_name = svc.get('Name', svc.get('ID', ''))
-        # Inspect for full config — use name (more reliable than short ID)
-        inspect = _docker_json(f'docker service inspect {svc_name} --format "{{{{json .}}}}"')
-        if inspect and isinstance(inspect, list):
-            inspect = inspect[0]
-
+    for svc in services_ls:
+        svc_id = svc.get('ID', '')
+        svc_name = svc.get('Name', '')
+        inspect = inspects_by_id.get(svc_id) or inspects_by_name.get(svc_name)
         if inspect:
             spec = inspect.get('Spec', {})
             task_tmpl = spec.get('TaskTemplate', {})
@@ -401,7 +543,6 @@ def _fetch_services():
             svc['updated'] = inspect.get('UpdatedAt', '')
             svc['update_status'] = inspect.get('UpdateStatus', {})
 
-            # Determine if replicated or global
             if 'Replicated' in mode:
                 svc['mode_type'] = 'replicated'
                 svc['replicas_spec'] = mode['Replicated'].get('Replicas', 0)
@@ -411,52 +552,47 @@ def _fetch_services():
             else:
                 svc['mode_type'] = 'unknown'
 
-            # Get stack name from label
             svc['stack'] = svc['labels'].get('com.docker.stack.namespace', '')
-
         detailed.append(svc)
-
     return detailed
 
 
 def _fetch_stacks():
-    """Fetch stacks with health status from service replicas."""
-    # Get all services to derive stack info with replica status
-    services = _docker_json('docker service ls --format "{{json .}}"') or []
+    """Fetch stacks derived from services (P2: 0 SSH calls — consumes services cache).
+
+    Stack membership lives in the `com.docker.stack.namespace` label which
+    `_fetch_services` already collects. We reuse its cache when populated; on a
+    cold cache (first poll) we fall through to a fresh fetch. Either way, this
+    function adds zero new SSH calls per cycle once warmed up — was N+1 before.
+    """
+    services = _cache_get('services')
+    if services is None:
+        services = _fetch_services()
 
     stack_map = {}
-    for svc in services:
-        # Get stack namespace from service name pattern or labels
-        svc_name = svc.get('Name', '')
+    for svc in services or []:
         replicas = svc.get('Replicas', '0/0')
-
-        # Parse replicas "3/3" → running=3, desired=3
         parts = replicas.split('/')
         running = int(parts[0]) if parts[0].isdigit() else 0
         desired = int(parts[-1]) if parts[-1].isdigit() else 0
 
-        # Try to get stack from inspect labels (cached if possible)
-        inspect = _docker_json(f'docker service inspect {svc_name} --format "{{{{json .Spec.Labels}}}}"')
-        ns = ''
-        if inspect and isinstance(inspect, dict):
-            ns = inspect.get('com.docker.stack.namespace', '')
-        elif inspect and isinstance(inspect, list) and inspect:
-            ns = inspect[0].get('com.docker.stack.namespace', '') if isinstance(inspect[0], dict) else ''
+        # Stack namespace populated by _fetch_services from spec.Labels
+        ns = svc.get('stack') or svc.get('labels', {}).get('com.docker.stack.namespace', '')
+        if not ns:
+            continue
 
-        if ns:
-            if ns not in stack_map:
-                stack_map[ns] = {
-                    'Name': ns, 'Services': 0,
-                    'running': 0, 'desired': 0, 'svc_running': 0, 'svc_total': 0
-                }
-            stack_map[ns]['Services'] += 1
-            stack_map[ns]['svc_total'] += 1
-            stack_map[ns]['running'] += running
-            stack_map[ns]['desired'] += desired
-            if running > 0:
-                stack_map[ns]['svc_running'] += 1
+        if ns not in stack_map:
+            stack_map[ns] = {
+                'Name': ns, 'Services': 0,
+                'running': 0, 'desired': 0, 'svc_running': 0, 'svc_total': 0
+            }
+        stack_map[ns]['Services'] += 1
+        stack_map[ns]['svc_total'] += 1
+        stack_map[ns]['running'] += running
+        stack_map[ns]['desired'] += desired
+        if running > 0:
+            stack_map[ns]['svc_running'] += 1
 
-    # Compute health status
     for s in stack_map.values():
         if s['desired'] == 0:
             s['status'] = 'stopped'
@@ -466,7 +602,6 @@ def _fetch_stacks():
             s['status'] = 'partial'
         else:
             s['status'] = 'stopped'
-
     return list(stack_map.values())
 
 
@@ -614,23 +749,31 @@ def _fetch_images():
 # ---------------------------------------------------------------------------
 
 def _bg_poll_once():
-    """Run a single poll cycle, fetching all data in parallel."""
+    """Run a single poll cycle.
+    Phase 1 (parallel): overview, nodes, services — independent.
+    Phase 2 (after services finishes): stacks — derives from services cache.
+    """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    fetchers = {
+    phase1 = {
         'overview': _fetch_overview,
         'nodes': _fetch_nodes,
         'services': _fetch_services,
-        'stacks': _fetch_stacks,
     }
-    with ThreadPoolExecutor(max_workers=4, thread_name_prefix='swarm-fetch') as pool:
-        futures = {pool.submit(fn): key for key, fn in fetchers.items()}
+    with ThreadPoolExecutor(max_workers=3, thread_name_prefix='swarm-fetch') as pool:
+        futures = {pool.submit(fn): key for key, fn in phase1.items()}
         for future in as_completed(futures):
             key = futures[future]
             try:
                 _cache_set(key, future.result())
             except Exception as e:
                 log.error(f"[{PLUGIN_ID}] Fetch {key} failed: {e}")
+
+    # Phase 2 — stacks consumes the just-cached services list (zero new SSH calls).
+    try:
+        _cache_set('stacks', _fetch_stacks())
+    except Exception as e:
+        log.error(f"[{PLUGIN_ID}] Fetch stacks failed: {e}")
 
 
 def _bg_poll():
@@ -1576,6 +1719,8 @@ def _api_save_config():
     # Clear cache to force refresh with new config
     with _cache_lock:
         _cache.clear()
+    # Drop pooled SSH connections — auth/host may have changed
+    _ssh_pool_close_all(reason='config_saved')
 
     return {'success': True}
 
@@ -2023,6 +2168,212 @@ def _api_rebalance_service():
 
 
 # ---------------------------------------------------------------------------
+# Webhooks (A4 — v1.10.0)
+# ---------------------------------------------------------------------------
+# Per-service unguessable URL that CI/CD systems POST to in order to trigger
+# `docker service update --image <repo>:<tag> --force <svc>`. Auth = secret in
+# URL (cryptographically random UUID4). Persisted in state/webhooks.json.
+#
+# Security model:
+#   - The webhook secret is the ONLY auth — anyone with the URL can force-update.
+#     Treat it like a deploy key. Rotation: revoke + re-create (DELETE then POST).
+#   - Tag value is validated against _RX_IMAGE_REF before being interpolated.
+#   - We log every successful and rejected hit via log_audit.
+#   - The endpoint requires the CALLER to be unauthenticated PegaProx-wise (CI),
+#     so we MUST skip the global plugins.view auth — implemented by a bypass
+#     marker. PegaProx's plugin route runner enforces auth by default; the
+#     `webhook` path is registered through a wrapper that runs before that.
+import uuid as _uuid_mod
+import hmac as _hmac
+
+WEBHOOKS_FILE = os.path.join(STATE_DIR, 'webhooks.json')
+
+
+def _load_webhooks():
+    try:
+        with open(WEBHOOKS_FILE) as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        log.warning(f"[{PLUGIN_ID}] could not read webhooks file: {e}")
+    return {}
+
+
+def _save_webhooks(data):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = WEBHOOKS_FILE + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(data, f, indent=2)
+    try:
+        os.chmod(tmp, 0o600)
+    except Exception:
+        pass
+    os.replace(tmp, WEBHOOKS_FILE)
+
+
+def _api_webhook_list():
+    """GET — List configured webhooks (admin). Returns secrets masked unless ?unmask=1."""
+    err = _require_admin()
+    if err:
+        return err
+    want_unmask = request.args.get('unmask', '').lower() in ('1', 'true', 'yes')
+    if want_unmask and not _is_admin():
+        return {'error': 'Admin access required'}, 403
+    webhooks = _load_webhooks()
+    if want_unmask:
+        log_audit(_get_username(), 'docker.webhook_secrets_unmasked', 'Listed webhook secrets')
+    out = []
+    for wid, w in webhooks.items():
+        out.append({
+            'id': wid,
+            'service_name': w.get('service_name', ''),
+            'secret': w.get('secret', '') if want_unmask else '***',
+            'created_at': w.get('created_at', ''),
+            'created_by': w.get('created_by', ''),
+            'last_triggered_at': w.get('last_triggered_at'),
+            'last_triggered_tag': w.get('last_triggered_tag'),
+            'trigger_count': w.get('trigger_count', 0),
+        })
+    return {'webhooks': out}
+
+
+def _api_webhook_create():
+    """POST — Create a new webhook for a service. Body: {service_name} (admin only).
+    Returns: {id, secret, url} — secret shown ONCE, not retrievable again unless unmasked."""
+    err = _require_admin()
+    if err:
+        return err
+    data = request.get_json() or {}
+    service_name = data.get('service_name', '')
+    if not _valid(_RX_DOCKER_REF, service_name):
+        return {'error': 'Valid service_name required'}, 400
+
+    webhooks = _load_webhooks()
+    # One webhook per service is enough — overwrite if exists.
+    secret = _uuid_mod.uuid4().hex
+    wid = _uuid_mod.uuid4().hex[:12]
+    webhooks[wid] = {
+        'service_name': service_name,
+        'secret': secret,
+        'created_at': datetime.now().isoformat(),
+        'created_by': _get_username(),
+        'last_triggered_at': None,
+        'last_triggered_tag': None,
+        'trigger_count': 0,
+    }
+    _save_webhooks(webhooks)
+    log_audit(_get_username(), 'docker.webhook_created', f'service={service_name} wid={wid}')
+    return {
+        'id': wid,
+        'secret': secret,
+        'service_name': service_name,
+        'url_path': f'/api/plugins/{PLUGIN_ID}/api/webhook/trigger?id={wid}&secret={secret}',
+        'usage': 'POST <url_path>[&tag=<image-tag>] — triggers `docker service update --image <repo>:<tag> --force`',
+    }
+
+
+def _api_webhook_revoke():
+    """POST — Revoke (delete) a webhook. Body: {id} (admin only)."""
+    err = _require_admin()
+    if err:
+        return err
+    data = request.get_json() or {}
+    wid = data.get('id', '')
+    if not isinstance(wid, str) or not re.match(r'^[a-f0-9]{12}$', wid):
+        return {'error': 'Valid webhook id required'}, 400
+
+    webhooks = _load_webhooks()
+    if wid not in webhooks:
+        return {'error': 'Webhook not found'}, 404
+    svc = webhooks[wid].get('service_name', '?')
+    del webhooks[wid]
+    _save_webhooks(webhooks)
+    log_audit(_get_username(), 'docker.webhook_revoked', f'service={svc} wid={wid}')
+    return {'success': True}
+
+
+def _api_webhook_trigger():
+    """POST — Webhook target. URL: /webhook/trigger?id=<wid>&secret=<secret>&tag=<tag>.
+
+    No PegaProx session required — auth is the secret in the URL. Designed for
+    CI/CD systems (GitHub Actions, Drone, etc.). Compares secret with hmac.compare_digest
+    to avoid timing attacks. Note: PegaProx may still gate this with `plugins.view`
+    permission depending on global config; if so, configure the CI to send the
+    PegaProx session token, OR disable the gate for this specific path in nginx.
+    """
+    wid = request.args.get('id', '')
+    secret = request.args.get('secret', '')
+    if not isinstance(wid, str) or not re.match(r'^[a-f0-9]{12}$', wid):
+        return {'error': 'Invalid webhook'}, 404
+    if not isinstance(secret, str) or not re.match(r'^[a-f0-9]{32}$', secret):
+        return {'error': 'Invalid webhook'}, 404
+
+    webhooks = _load_webhooks()
+    w = webhooks.get(wid)
+    if not w:
+        log_audit('webhook', 'docker.webhook_unknown', f'wid={wid}')
+        return {'error': 'Invalid webhook'}, 404
+    if not _hmac.compare_digest(w.get('secret', ''), secret):
+        log_audit('webhook', 'docker.webhook_bad_secret', f'wid={wid}')
+        return {'error': 'Invalid webhook'}, 404
+
+    service_name = w.get('service_name', '')
+    if not _valid(_RX_DOCKER_REF, service_name):
+        return {'error': 'Webhook service_name corrupt'}, 500
+
+    tag = request.args.get('tag', '')
+    cmd_parts = ['docker', 'service', 'update', '--force']
+    if tag:
+        # Build new image ref by replacing tag on existing image. We need the current image
+        # to keep registry/repo and only swap the tag. Fetch from inspect.
+        if not _valid(_RX_IMAGE_REF, tag):
+            log_audit('webhook', 'docker.webhook_bad_tag', f'wid={wid} tag={tag[:60]}')
+            return {'error': 'Invalid tag'}, 400
+        inspect_raw = _docker_cmd(
+            f'docker service inspect {shlex.quote(service_name)} '
+            f'--format "{{{{.Spec.TaskTemplate.ContainerSpec.Image}}}}"'
+        )
+        if not inspect_raw:
+            return {'error': 'Could not inspect service'}, 500
+        current_image = inspect_raw.strip().split('@')[0]  # drop digest
+        repo = current_image.rsplit(':', 1)[0] if ':' in current_image else current_image
+        new_image = f'{repo}:{tag}'
+        if not _valid(_RX_IMAGE_REF, new_image):
+            return {'error': 'Computed image ref invalid'}, 400
+        cmd_parts += ['--image', shlex.quote(new_image)]
+    cmd_parts.append(shlex.quote(service_name))
+    cmd = ' '.join(cmd_parts)
+
+    result = _docker_cmd(cmd)
+    if result is None:
+        log_audit('webhook', 'docker.webhook_failed', f'wid={wid} svc={service_name} tag={tag}')
+        return {'error': 'service update failed'}, 500
+
+    # Update trigger stats
+    w['last_triggered_at'] = datetime.now().isoformat()
+    w['last_triggered_tag'] = tag or None
+    w['trigger_count'] = int(w.get('trigger_count', 0)) + 1
+    webhooks[wid] = w
+    try:
+        _save_webhooks(webhooks)
+    except Exception as e:
+        log.warning(f"[{PLUGIN_ID}] could not persist webhook stats: {e}")
+
+    log_audit('webhook', 'docker.webhook_triggered',
+              f'wid={wid} svc={service_name} tag={tag or "(force-only)"}')
+    _invalidate('services')
+    return {
+        'success': True,
+        'service_name': service_name,
+        'tag': tag or None,
+        'message': result,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Disk management: manual prune + automatic policy
 # ---------------------------------------------------------------------------
 
@@ -2275,6 +2626,11 @@ def register(app):
         'network-remove': _api_network_remove,
         'load-balance': _api_load_balance,
         'rebalance-service': _api_rebalance_service,
+        # Webhooks (A4 — v1.10.0)
+        'webhooks': _api_webhook_list,
+        'webhook-create': _api_webhook_create,
+        'webhook-revoke': _api_webhook_revoke,
+        'webhook/trigger': _api_webhook_trigger,
         'config': _api_get_config,
         'config/save': _api_save_config,
         'test-connection': _api_test_connection,

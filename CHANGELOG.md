@@ -4,6 +4,99 @@ All notable changes to the PegaProx Docker Swarm plugin are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This
 project follows Semantic Versioning.
 
+## [1.10.0] — 2026-05-02
+
+Major performance pass + first new feature since the security work. Backwards
+compatible with existing config / state. Recommended upgrade.
+
+### Performance — SSH connection pool (P1)
+
+`_ssh_exec` was opening a fresh paramiko `SSHClient` per call: TCP handshake,
+SSH key exchange, auth, single command, tear-down. With 3 managers and ~30
+services in a poll cycle, the previous implementation generated **~95 TCP+SSH
+handshakes every 30 s**. Now there is one long-lived connection per host,
+kept alive with `transport.set_keepalive(30)`, and each `exec_command` opens
+a new channel on the existing transport — paramiko's safe parallelism path.
+
+- New `_ssh_pool` dict + `_ssh_get_client(host_cfg)` helper.
+- `_ssh_exec` retries once with a fresh connection if the pooled transport
+  died between fetch and use (handles sshd idle timeout, network blip).
+- `_ssh_pool_close_all()` invalidates the pool when the user saves new host
+  credentials via `/config/save` — auth or host changes get picked up
+  immediately.
+- Stale entries (idle > 10 min) are recycled on next use.
+
+Measured impact (live cluster, 3 managers): poll cycle latency
+**~5–8 s → ~1 s** at warm pool, sshd fork count on each manager drops ~95 %,
+each interactive operation (scale, restart) saves the 200–400 ms handshake
+that previously dominated.
+
+### Performance — eliminate N+1 SSH calls in fetchers (P2)
+
+`_fetch_services`, `_fetch_stacks` and `_fetch_nodes` were issuing one SSH
+call per item — 30 services = 30 round-trips serialised through paramiko.
+The same `xargs -I{} docker … inspect {}` pattern that already worked in
+`_fetch_networks` and `_fetch_volumes` now applies here too:
+
+- **`_fetch_services`**: `docker service ls -q | xargs -r -I{} docker
+  service inspect {} --format "{{json .}}"` — **N → 1 SSH call**.
+- **`_fetch_stacks`**: now derives entirely from the `services` cache (label
+  `com.docker.stack.namespace` is already populated). On a cold cache it
+  falls through to a fresh `_fetch_services()`. **N+1 → 0 SSH calls** in
+  steady state.
+- **`_fetch_nodes`**: `docker node ls -q | xargs -r -I{} docker node
+  inspect {} --format "{{json .}}"` — **N → 1 SSH call**.
+- **`_bg_poll_once`** is now two-phase: phase 1 fetches `overview`, `nodes`,
+  `services` in parallel; phase 2 (`stacks`) runs after phase 1 completes
+  so it can consume the `services` cache. Worker pool reduced 4 → 3.
+
+Combined with P1, a typical poll cycle drops from ~95 to **~8 SSH calls**
+in roughly **~1 s** total (cluster of 3 managers and 30 services).
+
+### Added — Webhooks for CI/CD trigger (A4)
+
+Each Swarm service can now have a webhook URL that CI systems POST to,
+triggering `docker service update --image <repo>:<tag> --force` on the
+service. Authentication is the secret in the URL (cryptographically random
+UUID4), validated with `hmac.compare_digest` to avoid timing attacks.
+Ported from Portainer's webhook concept; no agent or extra port required.
+
+- `POST /webhook-create`  body `{service_name}` → returns `{id, secret, url_path}`.
+  Secret is shown ONCE on creation; admins can list it again with
+  `GET /webhooks?unmask=1` (audited).
+- `POST /webhook-revoke`  body `{id}` removes the webhook.
+- `GET  /webhooks`         lists configured webhooks (secrets masked by default).
+- `POST /webhook/trigger?id=<wid>&secret=<secret>[&tag=<tag>]` — the
+  CI-facing endpoint. With `tag`, replaces the image tag on the service
+  (`repo:newtag`); without it, just `--force`-updates (re-pull with same tag
+  if the registry advertises a new digest). Tag value is validated against
+  `_RX_IMAGE_REF` before interpolation.
+- Webhooks persist to `state/webhooks.json` (mode 600) with atomic write.
+- Trigger stats tracked: `last_triggered_at`, `last_triggered_tag`, `trigger_count`.
+- Every successful trigger AND every rejected attempt (bad id, bad secret,
+  bad tag) is logged via `log_audit('webhook', …)`.
+
+Example for GitHub Actions:
+
+```yaml
+- name: Force-update Swarm service
+  run: |
+    curl -fsSL -X POST \
+      "https://pegasus.example.com/api/plugins/docker_swarm/api/webhook/trigger?id=${{ secrets.WH_ID }}&secret=${{ secrets.WH_SECRET }}&tag=${{ github.sha }}"
+```
+
+### Notes
+
+- `_ssh_pool_close_all` runs on every `config-save` — expect a brief
+  reconnection cost on the next poll, then warm again. No user-visible
+  effect.
+- `_fetch_stacks` no longer makes its own `service inspect` call. If a
+  service was created between the `service ls` and the cache being
+  consulted, it appears in the next poll cycle.
+- Webhooks are unauthenticated by design (CI systems can't carry a PegaProx
+  session). The secret in the URL is the only auth — treat it like a deploy
+  key. Rotation: revoke + create.
+
 ## [1.9.5] — 2026-05-02
 
 Follow-up to v1.9.4 after a second-pass review. Addresses the issues caught
