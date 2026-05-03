@@ -1323,6 +1323,223 @@ def _run_cluster_audit(service_filter=None):
 
 
 # ---------------------------------------------------------------------------
+# Policy Applier (v1.12.0 — Phase 2)
+# ---------------------------------------------------------------------------
+# Read-only auditor was Phase 1. Applier turns each finding's fix_hint into a
+# one-click `docker service update`. Admin-gated. Dry-run by default — must
+# pass confirm=true to actually mutate. Audited via log_audit on every call.
+#
+# Only 4 of the 10 checks have programmatic fixes. The rest need workload-
+# specific input (resource sizing, healthcheck command, replica count) and
+# stay manual — the UI surfaces fix_hint but no apply button.
+
+# Each applier is a function svc -> command-string. `applies_when` is a hook
+# that re-validates the precondition at apply time (race-safe — service may
+# have changed between audit and apply).
+
+def _applier_anti_affinity(svc):
+    name = svc.get('Name', '')
+    if not _valid(_RX_DOCKER_REF, name):
+        raise ValueError(f'Invalid service name: {name!r}')
+    return f"docker service update --placement-pref-add 'spread=node.id' {shlex.quote(name)}"
+
+
+def _applier_restart_policy(svc):
+    name = svc.get('Name', '')
+    if not _valid(_RX_DOCKER_REF, name):
+        raise ValueError(f'Invalid service name: {name!r}')
+    return f"docker service update --restart-condition any {shlex.quote(name)}"
+
+
+def _applier_update_rollback(svc):
+    name = svc.get('Name', '')
+    if not _valid(_RX_DOCKER_REF, name):
+        raise ValueError(f'Invalid service name: {name!r}')
+    return (
+        f"docker service update --update-failure-action rollback "
+        f"--update-monitor 30s {shlex.quote(name)}"
+    )
+
+
+def _applier_update_parallelism(svc):
+    name = svc.get('Name', '')
+    if not _valid(_RX_DOCKER_REF, name):
+        raise ValueError(f'Invalid service name: {name!r}')
+    return (
+        f"docker service update --update-parallelism 1 "
+        f"--update-order start-first {shlex.quote(name)}"
+    )
+
+
+POLICY_APPLIERS = {
+    'anti_affinity': {
+        'description': 'Añadir placement.preferences: spread=node.id',
+        'apply': _applier_anti_affinity,
+        'severity': 'P0',
+    },
+    'restart_policy': {
+        'description': 'Cambiar RestartPolicy.Condition a "any"',
+        'apply': _applier_restart_policy,
+        'severity': 'P2',
+    },
+    'update_rollback': {
+        'description': 'Setear UpdateConfig.FailureAction=rollback + Monitor=30s',
+        'apply': _applier_update_rollback,
+        'severity': 'P3',
+    },
+    'update_parallelism': {
+        'description': 'Setear UpdateConfig.Parallelism=1 + Order=start-first',
+        'apply': _applier_update_parallelism,
+        'severity': 'P3',
+    },
+}
+
+
+def _is_check_applicable(svc, check_id):
+    """Re-evaluate the check at apply time. Only 'fail' status warrants action."""
+    fn = _CHECK_FUNCS.get(check_id)
+    if not fn:
+        return False, 'check id desconocido'
+    try:
+        # ctx for re-eval — we don't really need healthy_nodes for the 4
+        # auto-fixers (none of them are gated by node count), but the
+        # check signature requires ctx. Fetch nodes lazily.
+        nodes = _cache_get('nodes') or _fetch_nodes() or []
+        healthy = sum(
+            1 for n in nodes
+            if (n.get('Availability', '') or '').lower() == 'active'
+            and (n.get('Status', '') or '').lower() == 'ready'
+        )
+        result = fn(svc, {'healthy_nodes': healthy, 'total_nodes': len(nodes)}) or {}
+    except Exception as e:
+        return False, f'error re-evaluando: {e}'
+    status = result.get('status', 'skip')
+    if status == 'fail':
+        return True, result.get('message', '')
+    return False, f'check ya no falla (status={status}): {result.get("message", "")}'
+
+
+def _api_policy_apply():
+    """POST — Apply an auto-fix for one (service, check_id) pair.
+
+    Body: {service_name: str, check_id: str, confirm: bool}
+      confirm=false (default) → dry-run: returns the command but does not run.
+      confirm=true            → actually executes; admin required.
+
+    Always re-validates that the check still fails before executing,
+    so a stale UI cannot apply a fix that's no longer needed.
+    """
+    err = _require_admin()
+    if err:
+        return err
+
+    payload = request.get_json(silent=True) or {}
+    service_name = (payload.get('service_name') or '').strip()
+    check_id = (payload.get('check_id') or '').strip()
+    confirm = bool(payload.get('confirm', False))
+
+    if not _valid(_RX_DOCKER_REF, service_name):
+        return {'error': 'Invalid service_name'}, 400
+    if not check_id or check_id not in POLICY_APPLIERS:
+        return {
+            'error': f'Unknown or non-fixable check_id. Auto-fixable: '
+                     f'{sorted(POLICY_APPLIERS.keys())}',
+        }, 400
+
+    services = _fetch_services() or []
+    svc = next((s for s in services if s.get('Name') == service_name), None)
+    if not svc:
+        return {'error': f'Service not found: {service_name}'}, 404
+
+    applicable, why = _is_check_applicable(svc, check_id)
+    if not applicable:
+        return {
+            'service': service_name,
+            'check_id': check_id,
+            'applicable': False,
+            'reason': why,
+        }, 200
+
+    applier = POLICY_APPLIERS[check_id]
+    try:
+        command = applier['apply'](svc)
+    except ValueError as e:
+        return {'error': str(e)}, 400
+
+    if not confirm:
+        # Dry-run: report the command we would run.
+        return {
+            'service': service_name,
+            'check_id': check_id,
+            'applicable': True,
+            'reason': why,
+            'description': applier['description'],
+            'command': command,
+            'dry_run': True,
+            'applied': False,
+        }
+
+    # Real run: execute via SSH on a Swarm manager.
+    out, errstr, rc = _ssh_exec(
+        _load_config().get('swarm_hosts', [{}])[0],
+        command=command,
+        timeout=60,
+    )
+
+    success = rc == 0
+    audit_data = {
+        'service': service_name,
+        'check_id': check_id,
+        'severity': applier['severity'],
+        'description': applier['description'],
+        'command': command,
+        'success': success,
+        'rc': rc,
+        'out_preview': (out or '')[:200],
+        'err_preview': (errstr or '')[:200],
+    }
+    try:
+        log_audit('policy_apply', audit_data, _get_username())
+    except Exception:
+        pass  # Audit should never block the response
+
+    # Invalidate cache so next audit reflects the change
+    _invalidate('services')
+    with _cache_lock:
+        _cache.pop(f'audit:', None)
+        _cache.pop(f'audit:all', None)
+        _cache.pop(f'audit:{service_name}', None)
+
+    return {
+        'service': service_name,
+        'check_id': check_id,
+        'applicable': True,
+        'description': applier['description'],
+        'command': command,
+        'dry_run': False,
+        'applied': success,
+        'rc': rc,
+        'output': (out or '')[:500],
+        'error': (errstr or '') if not success else '',
+    }, (200 if success else 500)
+
+
+def _api_policy_appliers():
+    """GET — Catalog of which checks have a programmatic fix available."""
+    return {
+        'appliers': [
+            {
+                'check_id': k,
+                'severity': v['severity'],
+                'description': v['description'],
+            }
+            for k, v in POLICY_APPLIERS.items()
+        ],
+        'manual_only': sorted(set(c['id'] for c in POLICY_CHECKS) - set(POLICY_APPLIERS.keys())),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Permission check
 # ---------------------------------------------------------------------------
 
@@ -3194,6 +3411,9 @@ def register(app):
         # Policy Auditor (v1.11.0 — Phase 1)
         'policy/audit': _api_policy_audit,
         'policy/checks': _api_policy_checks,
+        # Policy Applier (v1.12.0 — Phase 2)
+        'policy/apply': _api_policy_apply,
+        'policy/appliers': _api_policy_appliers,
         # Webhooks (A4 — v1.10.0)
         'webhooks': _api_webhook_list,
         'webhook-create': _api_webhook_create,

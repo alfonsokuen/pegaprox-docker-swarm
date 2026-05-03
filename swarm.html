@@ -1719,10 +1719,22 @@ function GradeBadge({ grade, size = 'md' }) {
   }}>{grade}</span>;
 }
 
+// Set of check_ids whose fix the backend can auto-apply via /policy/apply.
+// Mirror of POLICY_APPLIERS keys in __init__.py — kept in sync manually.
+// If they ever drift, the apply endpoint returns 400 with the auth list.
+const AUTO_FIXABLE_CHECKS = new Set([
+  'anti_affinity',
+  'restart_policy',
+  'update_rollback',
+  'update_parallelism',
+]);
+
 function Audit({ data, onRefresh, toast }) {
   const [expanded, setExpanded] = useState(null);  // service_id of expanded row
   const [filter, setFilter] = useState('all');     // all | non-a | f-only
   const [stackFilter, setStackFilter] = useState('');
+  const [applying, setApplying] = useState(null);  // {service, check_id} being applied
+  const [applyModal, setApplyModal] = useState(null);  // dry-run result + confirm dialog
 
   if (!data) return <div className="card" style={{padding:20,color:'var(--muted)'}}>Cargando auditoría…</div>;
   if (data.error) return <div className="card" style={{padding:20,color:'var(--red)'}}>{data.error}</div>;
@@ -1744,6 +1756,34 @@ function Audit({ data, onRefresh, toast }) {
 
   const totalP0 = audits.reduce((sum, a) => sum + (a.summary?.issues_by_severity?.P0 || 0), 0);
   const totalP1 = audits.reduce((sum, a) => sum + (a.summary?.issues_by_severity?.P1 || 0), 0);
+
+  // Two-step apply: dry-run shows the exact docker command in a modal, user confirms,
+  // we POST again with confirm:true. Backend re-validates the check still fails.
+  const doApplyDryRun = async (service, check_id) => {
+    setApplying({service, check_id});
+    try {
+      const r = await api('policy/apply', {method:'POST', body:{service_name: service, check_id, confirm: false}});
+      if (r._http === 403) { toast('Requiere admin para aplicar fixes', 'error'); setApplying(null); return; }
+      if (r.error) { toast(r.error, 'error'); setApplying(null); return; }
+      if (!r.applicable) { toast(`No aplicable: ${r.reason}`, 'info'); setApplying(null); onRefresh(); return; }
+      setApplyModal({service, check_id, command: r.command, description: r.description, reason: r.reason});
+    } catch (e) { toast('Error: ' + (e.message||e), 'error'); }
+    setApplying(null);
+  };
+
+  const doApplyConfirm = async () => {
+    if (!applyModal) return;
+    const {service, check_id} = applyModal;
+    setApplying({service, check_id});
+    setApplyModal(null);
+    try {
+      const r = await api('policy/apply', {method:'POST', body:{service_name: service, check_id, confirm: true}});
+      if (r.error) toast(r.error, 'error');
+      else if (r.applied) { toast(`✓ Fix aplicado a ${service}`, 'success'); onRefresh(); }
+      else toast(`Falló (rc=${r.rc}): ${r.error || r.output || 'unknown'}`, 'error');
+    } catch (e) { toast('Error: ' + (e.message||e), 'error'); }
+    setApplying(null);
+  };
 
   return <div>
     {/* Top: cluster grade + summary */}
@@ -1803,6 +1843,33 @@ function Audit({ data, onRefresh, toast }) {
       <button className="btn btn-sm" onClick={onRefresh}>Refresh</button>
     </div>
 
+    {/* Confirmation modal for apply */}
+    {applyModal && <div className="modal-overlay" onClick={()=>setApplyModal(null)}>
+      <div className="modal" onClick={e=>e.stopPropagation()} style={{maxWidth:680}}>
+        <div style={{fontSize:16,fontWeight:600,marginBottom:8}}>⚡ Confirmar fix automático</div>
+        <div style={{fontSize:12,color:'var(--muted)',marginBottom:16}}>
+          Vas a ejecutar <code>docker service update</code> sobre <strong style={{color:'var(--accent)'}}>{applyModal.service}</strong>.
+          Swarm hará un rolling update — las réplicas se reemplazarán una por una.
+        </div>
+        <div style={{padding:'8px 12px',background:'rgba(255,255,255,.04)',border:'1px solid var(--border)',borderRadius:6,marginBottom:12}}>
+          <div style={{fontSize:11,color:'var(--muted)',textTransform:'uppercase',marginBottom:4}}>Acción</div>
+          <div style={{fontSize:13}}>{applyModal.description}</div>
+        </div>
+        <div style={{padding:'8px 12px',background:'#000',border:'1px solid var(--border)',borderRadius:6,marginBottom:12,
+          fontFamily:'monospace',fontSize:11,color:'#0f0',whiteSpace:'pre-wrap',wordBreak:'break-all'}}>
+          $ {applyModal.command}
+        </div>
+        <div style={{padding:'6px 10px',background:'rgba(234,179,8,.1)',border:'1px solid rgba(234,179,8,.3)',
+          borderRadius:6,fontSize:11,color:'var(--yellow)',marginBottom:16}}>
+          ⚠ Pre-condición confirmada: {applyModal.reason || 'check sigue fallando'}
+        </div>
+        <div style={{display:'flex',gap:8,justifyContent:'flex-end'}}>
+          <button className="btn" onClick={()=>setApplyModal(null)}>Cancelar</button>
+          <button className="btn btn-primary" onClick={doApplyConfirm}>Aplicar ahora</button>
+        </div>
+      </div>
+    </div>}
+
     {/* Per-service table */}
     <div className="card" style={{padding:0,overflow:'hidden'}}>
       <table>
@@ -1860,6 +1927,15 @@ function Audit({ data, onRefresh, toast }) {
                               border:'1px solid rgba(229,112,0,.25)', borderRadius:6,
                               fontFamily:'monospace', fontSize:11, color:'var(--accent)', whiteSpace:'pre-wrap',
                             }}>{f.fix_hint}</div>}
+                            {AUTO_FIXABLE_CHECKS.has(f.id) && f.status === 'fail' && <div style={{marginTop:8}}>
+                              <button className="btn btn-sm btn-primary"
+                                disabled={applying && applying.service === a.service_name && applying.check_id === f.id}
+                                onClick={(e) => { e.stopPropagation(); doApplyDryRun(a.service_name, f.id); }}>
+                                {applying && applying.service === a.service_name && applying.check_id === f.id
+                                  ? <span><span className="spinner" style={{width:12,height:12,verticalAlign:'middle',marginRight:4}}/> Aplicando…</span>
+                                  : '⚡ Aplicar fix automático'}
+                              </button>
+                            </div>}
                           </td>
                         </tr>;
                       })}

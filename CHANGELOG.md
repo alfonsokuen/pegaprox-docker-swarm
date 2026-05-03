@@ -4,6 +4,83 @@ All notable changes to the PegaProx Docker Swarm plugin are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This
 project follows Semantic Versioning.
 
+## [1.12.0] — 2026-05-02
+
+Phase 2 of the durable-cluster-health story: the **Policy Applier**. The
+auditor (1.11.x) tells you what to change; this release adds a one-click
+button next to each finding so you can actually apply the fix from the
+UI. Read-only checks remain — only fixes you explicitly confirm execute.
+
+### Added — Policy Applier
+
+A new `POST /policy/apply` endpoint and an "⚡ Aplicar fix automático"
+button next to each fixable finding in the Auditoría tab. The flow is
+two-step:
+
+1. **Click "Aplicar"** → backend re-evaluates the check (race-safe;
+   the audit you saw might be stale) and returns the exact `docker
+   service update` command, the human description, and the precondition
+   confirmation. Nothing is mutated yet.
+2. **Confirmation modal** shows the command verbatim. Click "Aplicar
+   ahora" → backend re-runs the same dry-run validation, then executes
+   the command via SSH on the configured Swarm manager.
+
+Every apply is recorded via `log_audit('policy_apply', …)` with the
+exact command, exit code, output preview, and the user who triggered
+it. After a successful apply, the audit cache is invalidated so the
+next `Refresh` shows the new grade.
+
+### Auto-fixable checks (4 of 10)
+
+Only checks whose remediation is mechanical and safe under all common
+configurations are auto-fixable. The other six need workload-specific
+input from a human (CPU/memory sizing, healthcheck command, choosing a
+specific image tag, deciding whether to scale up).
+
+| Check | Severity | Fix applied |
+|---|---|---|
+| `anti_affinity` | P0 | `--placement-pref-add 'spread=node.id'` |
+| `restart_policy` | P2 | `--restart-condition any` |
+| `update_rollback` | P3 | `--update-failure-action rollback --update-monitor 30s` |
+| `update_parallelism` | P3 | `--update-parallelism 1 --update-order start-first` |
+
+The remaining checks (`replicas_vs_nodes`, `resource_reservations`,
+`resource_limits`, `single_replica_risk`, `image_pinning`, `healthcheck`)
+keep their textual `fix_hint` in the UI but no apply button.
+
+### Safety
+
+- **Admin-only** — `_require_admin()` gates the endpoint. Non-admins
+  see the findings and fix hints but can't apply.
+- **Race-safe** — the backend re-fetches the service spec at apply
+  time and re-runs the check. If the service was already fixed (by
+  a redeploy, another admin, etc.), the apply is a no-op and the UI
+  reports it.
+- **Single change per apply** — the API accepts one `(service_name,
+  check_id)` pair. Bulk fixes are deliberately not supported in 1.12.0
+  to keep the audit trail clean and limit the blast radius of mistakes.
+- **Cache invalidation** — services + audit caches are dropped on
+  successful apply. The next audit reflects reality.
+
+### Added — `GET /policy/appliers`
+
+Catalog endpoint that returns which `check_id`s have a programmatic
+fix and which are manual-only. Used by external tooling to introspect
+the contract; not used by the UI yet.
+
+### Why this matters
+
+Phase 1 (1.11.x) reduced "Are my services configured well?" from a
+manual review across 77 docker-compose files to a single grade. Phase
+2 closes the loop: the four most-common-finding-categories — missing
+spread, broken restart policy, no auto-rollback, implicit parallelism —
+now go from "I should fix this someday" to "I clicked the button and
+it's fixed." Phase 3 (1.13.x) will add resource-pressure history so
+balance can mean more than "even task counts" — but that's a bigger
+chunk of work and ships separately.
+
+---
+
 ## [1.11.1] — 2026-05-02
 
 Hotfix to a real false positive surfaced when reviewing the v1.11.0 audit
