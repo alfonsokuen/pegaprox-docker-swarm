@@ -74,12 +74,22 @@ const { useState, useEffect, useCallback, useRef } = React;
 const API = '/api/plugins/docker_swarm/api';
 
 async function api(path, opts = {}) {
-  const res = await fetch(`${API}/${path}`, {
-    ...opts,
-    headers: { 'Content-Type': 'application/json', ...opts.headers },
-    body: opts.body ? JSON.stringify(opts.body) : undefined,
-  });
-  return res.json();
+  let res;
+  try {
+    res = await fetch(`${API}/${path}`, {
+      ...opts,
+      headers: { 'Content-Type': 'application/json', ...opts.headers },
+      body: opts.body ? JSON.stringify(opts.body) : undefined,
+    });
+  } catch (e) {
+    return { error: 'Network error: ' + (e.message || e), _http: 0 };
+  }
+  let data = null;
+  try { data = await res.json(); } catch (e) { data = { error: 'Invalid JSON response', _raw: '' }; }
+  if (!data || typeof data !== 'object') data = { error: 'Empty response' };
+  data._http = res.status;
+  if (res.status === 403 && !data.error) data.error = 'Acceso denegado: requiere admin';
+  return data;
 }
 
 // Format helpers
@@ -523,14 +533,24 @@ function ServiceDetail({ serviceId, onBack, toast }) {
   const [logsLoading, setLogsLoading] = useState(false);
   const [editReplicas, setEditReplicas] = useState('');
   const [editImage, setEditImage] = useState('');
+  const [unmasked, setUnmasked] = useState(false);
 
-  const load = async () => {
+  const load = async (opts = {}) => {
     setLoading(true);
-    const d = await api(`service-detail?service_id=${encodeURIComponent(serviceId)}`);
+    const q = opts.unmask ? '&unmask=1' : '';
+    const d = await api(`service-detail?service_id=${encodeURIComponent(serviceId)}${q}`);
+    if (d._http === 403) toast(d.error || 'Acceso denegado', 'error');
     setSvc(d); setEditReplicas(d.replicas ?? ''); setEditImage(d.image?.split('@')[0] || '');
+    setUnmasked(!!opts.unmask && d.env_masked === false);
     setLoading(false);
   };
   useEffect(() => { load(); }, [serviceId]);
+
+  const toggleUnmask = async () => {
+    if (unmasked) { setUnmasked(false); load(); return; }
+    if (!confirm('Mostrar valores reales de variables sensibles? Esta acción queda registrada en el audit log.')) return;
+    load({ unmask: true });
+  };
 
   const loadLogs = async () => { setLogsLoading(true); const r = await api(`service-logs?service_id=${encodeURIComponent(serviceId)}&tail=200`); setLogs(r.logs||''); setLogsLoading(false); };
 
@@ -618,10 +638,18 @@ function ServiceDetail({ serviceId, onBack, toast }) {
         </div>}
 
         {section==='env' && <div className="card fade-in">
-          <h4 style={{fontSize:14,fontWeight:600,marginBottom:12}}>Environment variables ({svc.env?.length||0})</h4>
+          <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:12}}>
+            <h4 style={{fontSize:14,fontWeight:600,margin:0}}>Environment variables ({svc.env?.length||0})</h4>
+            <div style={{display:'flex',alignItems:'center',gap:8}}>
+              {svc.env_masked && <span style={{fontSize:11,color:'var(--muted)'}}>Valores sensibles ocultos</span>}
+              <button className="btn btn-sm" onClick={toggleUnmask}>
+                {unmasked ? 'Ocultar' : 'Mostrar reales (admin)'}
+              </button>
+            </div>
+          </div>
           {(svc.env||[]).length ? <div style={{background:'var(--bg)',borderRadius:6,padding:8,fontFamily:'monospace',fontSize:12,maxHeight:400,overflow:'auto'}}>
-            {svc.env.map((e,i)=>{const [k,...v]=e.split('=');const val=v.join('=');const sensitive=/password|secret|key|token|api_key/i.test(k);
-              return <div key={i} style={{padding:'3px 0',borderBottom:'1px solid var(--border)'}}><span style={{color:'var(--blue)'}}>{k}</span>=<span style={{color:sensitive?'var(--red)':'var(--green)'}}>{sensitive?'••••••••':val}</span></div>;})}
+            {svc.env.map((e,i)=>{const [k,...v]=e.split('=');const val=v.join('=');const sensitive=/password|secret|token|apikey|api_key|jwt|bearer|auth|private|credential|dsn|passwd|passphrase/i.test(k);const serverMasked=val==='***';
+              return <div key={i} style={{padding:'3px 0',borderBottom:'1px solid var(--border)'}}><span style={{color:'var(--blue)'}}>{k}</span>=<span style={{color:sensitive||serverMasked?'var(--red)':'var(--green)'}}>{val}</span></div>;})}
           </div> : <div style={{color:'var(--muted)'}}>No hay variables de entorno</div>}
         </div>}
 

@@ -1,6 +1,8 @@
 config.json
 config.json.bak
 .ssh/
+known_hosts
+state/
 __pycache__/
 *.pyc
 .DS_Store

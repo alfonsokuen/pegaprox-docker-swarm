@@ -16,8 +16,11 @@ Features:
 """
 
 import os
+import re
 import json
 import time
+import shlex
+import zlib
 import logging
 import threading
 from datetime import datetime
@@ -30,6 +33,8 @@ from pegaprox.utils.audit import log_audit
 PLUGIN_ID = 'docker_swarm'
 PLUGIN_NAME = 'Docker Swarm Manager'
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+STATE_DIR = os.path.join(PLUGIN_DIR, 'state')
+KNOWN_HOSTS_PATH = os.path.join(PLUGIN_DIR, 'known_hosts')
 log = logging.getLogger(f'plugin.{PLUGIN_ID}')
 
 # In-memory cache
@@ -40,6 +45,78 @@ CACHE_TTL = 8  # seconds — short for near-realtime feel
 # Background thread
 _bg_thread = None
 _bg_stop = threading.Event()
+
+# Cache key dependency map: which keys to invalidate per "domain"
+_CACHE_DEPS = {
+    'services': ('services', 'overview', 'stacks'),
+    'stacks':   ('stacks', 'services', 'overview'),
+    'nodes':    ('nodes', 'overview'),
+    'all':      ('overview', 'nodes', 'services', 'stacks'),
+}
+
+def _invalidate(domain='services'):
+    """Invalidate cache keys related to a domain so the next request fetches fresh data."""
+    keys = _CACHE_DEPS.get(domain, (domain,))
+    with _cache_lock:
+        for k in keys:
+            _cache.pop(k, None)
+
+
+# ---------------------------------------------------------------------------
+# Input validation helpers (allowlists for use in shell command interpolation)
+# ---------------------------------------------------------------------------
+
+# Docker IDs / service-names / container-names / volume / network names
+_RX_DOCKER_REF = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.\-]{0,254}$')
+# Stack names (more restrictive — used in filenames)
+_RX_STACK_NAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_\-]{0,62}$')
+# Image refs: registry/path:tag@sha256:digest — broad but safe (no shell metas)
+_RX_IMAGE_REF = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.:/@\-]{0,254}$')
+# Resource limits: numbers, dots, units (m, M, G, etc.)
+_RX_RESOURCE = re.compile(r'^[0-9.]+[a-zA-Z]{0,3}$')
+# Env entry: KEY=value where value can be anything except newlines/null
+_RX_ENV_ENTRY = re.compile(r'^[A-Za-z_][A-Za-z0-9_]{0,127}(=[^\n\x00]*)?$')
+
+def _valid(rx, s):
+    return isinstance(s, str) and bool(rx.match(s))
+
+
+# ---------------------------------------------------------------------------
+# Sensitive env masking
+# ---------------------------------------------------------------------------
+
+_RX_SENSITIVE_ENV = re.compile(
+    r'(password|secret|token|apikey|api_key|jwt|bearer|auth|private|credential|dsn|passwd|passphrase)',
+    re.IGNORECASE,
+)
+
+def _mask_env_list(envs, unmask=False):
+    """Mask values of env entries whose KEY looks sensitive.
+    Input/output: list of "KEY=value" strings."""
+    if unmask or not envs:
+        return envs
+    out = []
+    for e in envs:
+        if not isinstance(e, str) or '=' not in e:
+            out.append(e)
+            continue
+        key, _, _ = e.partition('=')
+        if _RX_SENSITIVE_ENV.search(key):
+            out.append(f'{key}=***')
+        else:
+            out.append(e)
+    return out
+
+
+def _is_admin():
+    """Return True if current request user is admin. Returns False on any error."""
+    try:
+        from pegaprox.models.permissions import ROLE_ADMIN
+        username = request.session.get('user', '')
+        users = load_users()
+        return users.get(username, {}).get('role') == ROLE_ADMIN
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +138,29 @@ def _save_config(cfg):
         json.dump(cfg, f, indent=4)
 
 
+class _PersistentTOFUPolicy:
+    """First-connect: auto-add the host key and persist it to known_hosts.
+    Subsequent connections will find the key already in known_hosts; if the
+    remote presents a *different* key, paramiko itself rejects (BadHostKeyException).
+    This gives us defence in depth: real MITM after first contact gets caught."""
+    def __init__(self, known_hosts_path):
+        self._path = known_hosts_path
+
+    def missing_host_key(self, client, hostname, key):
+        try:
+            client.get_host_keys().add(hostname, key.get_name(), key)
+            os.makedirs(os.path.dirname(self._path), exist_ok=True)
+            client.save_host_keys(self._path)
+            try:
+                os.chmod(self._path, 0o600)
+            except Exception:
+                pass
+            log.info(f"[{PLUGIN_ID}] new host key persisted for {hostname} "
+                     f"({key.get_name()} fp={key.get_fingerprint().hex()})")
+        except Exception as e:
+            log.warning(f"[{PLUGIN_ID}] could not persist host key for {hostname}: {e}")
+
+
 def _ssh_exec(host_cfg_or_host, user=None, password=None, command='', timeout=15):
     """Execute command on remote host via SSH, return (stdout, stderr, exit_code).
 
@@ -68,6 +168,8 @@ def _ssh_exec(host_cfg_or_host, user=None, password=None, command='', timeout=15
       - A host config dict: {host, user, key_file?, password?}
       - Legacy positional args: (host, user, password, command)
     Prefers key_file auth when available, falls back to password.
+    Host keys are persisted to known_hosts on first contact (TOFU); later
+    mismatches are rejected by paramiko.
     """
     import paramiko
 
@@ -83,7 +185,14 @@ def _ssh_exec(host_cfg_or_host, user=None, password=None, command='', timeout=15
         key_file = ''
 
     client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    # Load previously-seen keys so paramiko enforces them.
+    if os.path.isfile(KNOWN_HOSTS_PATH):
+        try:
+            client.load_host_keys(KNOWN_HOSTS_PATH)
+        except Exception as e:
+            log.warning(f"[{PLUGIN_ID}] could not load known_hosts: {e}")
+    # On a first-time host: persist the key. On a mismatch: paramiko raises BadHostKeyException.
+    client.set_missing_host_key_policy(_PersistentTOFUPolicy(KNOWN_HOSTS_PATH))
     try:
         connect_kwargs = dict(
             hostname=host, port=22, username=user,
@@ -107,6 +216,9 @@ def _ssh_exec(host_cfg_or_host, user=None, password=None, command='', timeout=15
         out = stdout.read().decode('utf-8', errors='replace')
         err = stderr.read().decode('utf-8', errors='replace')
         return out, err, exit_code
+    except paramiko.BadHostKeyException as e:
+        log.error(f"[{PLUGIN_ID}] HOST KEY MISMATCH for {host} — possible MITM: {e}")
+        return '', f'Host key mismatch for {host} (refusing to connect)', -1
     except Exception as e:
         return '', str(e), -1
     finally:
@@ -522,13 +634,15 @@ def _bg_poll_once():
 
 
 def _bg_poll():
-    """Background thread that refreshes cache periodically + runs disk auto-prune."""
-    cfg = _load_config()
-    interval = cfg.get('poll_interval', 30)
-    log.info(f"[{PLUGIN_ID}] Background poll started (interval={interval}s)")
+    """Background thread that refreshes cache periodically + runs disk auto-prune.
+    poll_interval is re-read every iteration so Settings changes take effect live."""
+    log.info(f"[{PLUGIN_ID}] Background poll started")
 
     last_disk_check = 0
     while not _bg_stop.is_set():
+        cfg_now = _load_config()
+        interval = max(5, int(cfg_now.get('poll_interval', 30)))
+
         try:
             _bg_poll_once()
         except Exception as e:
@@ -536,7 +650,6 @@ def _bg_poll():
 
         # Disk auto-prune check según intervalo configurable
         try:
-            cfg_now = _load_config()
             auto = cfg_now.get('disk_auto_prune', {})
             if auto.get('enabled'):
                 check_min = auto.get('check_interval_min', 30)
@@ -634,12 +747,17 @@ def _api_images():
 
 
 def _api_service_detail():
-    """GET — Full service inspect with all config sections. ?service_id=xxx"""
+    """GET — Full service inspect with all config sections. ?service_id=xxx[&unmask=1]
+    Sensitive env values (matching password|secret|token|key|jwt|auth|...) are masked
+    by default; admins can request the raw values via ?unmask=1 (logged for audit)."""
     service_id = request.args.get('service_id', '')
-    if not service_id:
-        return {'error': 'service_id required'}, 400
-    if not all(c.isalnum() or c in '-_.' for c in service_id):
-        return {'error': 'Invalid service_id'}, 400
+    if not _valid(_RX_DOCKER_REF, service_id):
+        return {'error': 'Valid service_id required'}, 400
+    want_unmask = request.args.get('unmask', '').lower() in ('1', 'true', 'yes')
+    can_unmask = want_unmask and _is_admin()
+    if want_unmask and can_unmask:
+        log_audit(_get_username(), 'docker.service_envs_unmasked',
+                  f'Viewed unmasked envs for {service_id}')
 
     inspect = _docker_json(f'docker service inspect {service_id} --format "{{{{json .}}}}"')
     if inspect and isinstance(inspect, list):
@@ -685,7 +803,8 @@ def _api_service_detail():
         'image': container_spec.get('Image', ''),
         'command': container_spec.get('Command', []),
         'args': container_spec.get('Args', []),
-        'env': container_spec.get('Env', []),
+        'env': _mask_env_list(container_spec.get('Env', []), unmask=can_unmask),
+        'env_masked': not can_unmask,
         'dir': container_spec.get('Dir', ''),
         'user': container_spec.get('User', ''),
         'hostname': container_spec.get('Hostname', ''),
@@ -760,57 +879,82 @@ def _api_service_detail():
 
 
 def _api_service_rollback():
-    """POST — Rollback a service. Body: {service_id}"""
+    """POST — Rollback a service. Body: {service_id} (admin only)"""
+    err = _require_admin()
+    if err:
+        return err
     data = request.get_json() or {}
     service_id = data.get('service_id', '')
-    if not service_id:
-        return {'error': 'service_id required'}, 400
-    if not all(c.isalnum() or c in '-_.' for c in service_id):
-        return {'error': 'Invalid service_id'}, 400
+    if not _valid(_RX_DOCKER_REF, service_id):
+        return {'error': 'Valid service_id required'}, 400
 
-    result = _docker_cmd(f'docker service rollback {service_id}')
+    result = _docker_cmd(f'docker service rollback {shlex.quote(service_id)}')
     if result is not None:
         log_audit(_get_username(), 'docker.service_rollback', f'Rolled back service {service_id}')
-        with _cache_lock:
-            _cache.pop('services', None)
+        _invalidate('services')
         return {'success': True, 'message': f'Service {service_id} rolled back'}
     return {'error': 'Rollback failed'}, 500
 
 
 def _api_service_update():
-    """POST — Update service config. Body: {service_id, image, replicas, env, ...}"""
+    """POST — Update service config. Body: {service_id, image, replicas, env, ...} (admin only)
+    All user-controlled args are validated against allowlists before being shlex.quote'd
+    into the command. No raw interpolation of strings into the shell."""
+    err = _require_admin()
+    if err:
+        return err
     data = request.get_json() or {}
     service_id = data.get('service_id', '')
-    if not service_id or not all(c.isalnum() or c in '-_.' for c in service_id):
+    if not _valid(_RX_DOCKER_REF, service_id):
         return {'error': 'Valid service_id required'}, 400
 
-    cmd_parts = [f'docker service update']
+    cmd_parts = ['docker', 'service', 'update']
 
-    if 'image' in data and data['image']:
-        cmd_parts.append(f'--image {data["image"]}')
-    if 'replicas' in data and data['replicas'] is not None:
-        cmd_parts.append(f'--replicas {int(data["replicas"])}')
-    if 'force' in data and data['force']:
+    if data.get('image'):
+        if not _valid(_RX_IMAGE_REF, data['image']):
+            return {'error': 'Invalid image ref'}, 400
+        cmd_parts += ['--image', shlex.quote(data['image'])]
+
+    if data.get('replicas') is not None:
+        try:
+            r = int(data['replicas'])
+            if r < 0 or r > 1000:
+                return {'error': 'replicas out of range (0-1000)'}, 400
+        except (TypeError, ValueError):
+            return {'error': 'replicas must be int'}, 400
+        cmd_parts += ['--replicas', str(r)]
+
+    if data.get('force'):
         cmd_parts.append('--force')
-    if 'env_add' in data:
-        for e in data['env_add']:
-            cmd_parts.append(f'--env-add "{e}"')
-    if 'env_rm' in data:
-        for e in data['env_rm']:
-            cmd_parts.append(f'--env-rm "{e}"')
-    if 'limit_cpu' in data:
-        cmd_parts.append(f'--limit-cpu {data["limit_cpu"]}')
-    if 'limit_memory' in data:
-        cmd_parts.append(f'--limit-memory {data["limit_memory"]}')
 
-    cmd_parts.append(service_id)
+    for e in data.get('env_add', []) or []:
+        if not _valid(_RX_ENV_ENTRY, e):
+            return {'error': f'Invalid env_add entry: {e[:60]}'}, 400
+        cmd_parts += ['--env-add', shlex.quote(e)]
+
+    for e in data.get('env_rm', []) or []:
+        # env_rm is just the KEY — must be a valid env name
+        if not isinstance(e, str) or not re.match(r'^[A-Za-z_][A-Za-z0-9_]{0,127}$', e):
+            return {'error': f'Invalid env_rm entry: {e[:60]}'}, 400
+        cmd_parts += ['--env-rm', shlex.quote(e)]
+
+    if 'limit_cpu' in data and data['limit_cpu'] != '':
+        if not _valid(_RX_RESOURCE, str(data['limit_cpu'])):
+            return {'error': 'Invalid limit_cpu'}, 400
+        cmd_parts += ['--limit-cpu', shlex.quote(str(data['limit_cpu']))]
+
+    if 'limit_memory' in data and data['limit_memory'] != '':
+        if not _valid(_RX_RESOURCE, str(data['limit_memory'])):
+            return {'error': 'Invalid limit_memory'}, 400
+        cmd_parts += ['--limit-memory', shlex.quote(str(data['limit_memory']))]
+
+    cmd_parts.append(shlex.quote(service_id))
     cmd = ' '.join(cmd_parts)
 
     result = _docker_cmd(cmd)
     if result is not None:
         log_audit(_get_username(), 'docker.service_updated', f'Updated service {service_id}')
-        with _cache_lock:
-            _cache.pop('services', None)
+        _invalidate('services')
         return {'success': True, 'message': result or f'Service {service_id} updated'}
     return {'error': 'Update failed'}, 500
 
@@ -864,59 +1008,57 @@ def _api_container_logs():
 
 
 def _api_service_scale():
-    """POST — Scale a service. Body: {service_id, replicas}"""
+    """POST — Scale a service. Body: {service_id, replicas} (admin only)"""
+    err = _require_admin()
+    if err:
+        return err
     data = request.get_json() or {}
     service_id = data.get('service_id', '')
     replicas = data.get('replicas')
 
-    if not service_id or replicas is None:
+    if replicas is None:
         return {'error': 'service_id and replicas required'}, 400
-
-    if not all(c.isalnum() or c in '-_.' for c in service_id):
-        return {'error': 'Invalid service_id'}, 400
+    if not _valid(_RX_DOCKER_REF, service_id):
+        return {'error': 'Valid service_id required'}, 400
 
     try:
         replicas = int(replicas)
-        if replicas < 0 or replicas > 100:
-            return {'error': 'Replicas must be 0-100'}, 400
-    except ValueError:
+        if replicas < 0 or replicas > 1000:
+            return {'error': 'Replicas must be 0-1000'}, 400
+    except (TypeError, ValueError):
         return {'error': 'Replicas must be integer'}, 400
 
-    result = _docker_cmd(f'docker service scale {service_id}={replicas}')
+    result = _docker_cmd(f'docker service scale {shlex.quote(service_id)}={replicas}')
     if result is not None:
         log_audit(_get_username(), 'docker.service_scaled',
                   f'Scaled {service_id} to {replicas} replicas')
-        # Invalidate cache
-        with _cache_lock:
-            _cache.pop('services', None)
-            _cache.pop('overview', None)
+        _invalidate('services')
         return {'success': True, 'message': result}
     return {'error': 'Scale command failed'}, 500
 
 
 def _api_service_restart():
-    """POST — Force update (restart) a service. Body: {service_id}"""
+    """POST — Force update (restart) a service. Body: {service_id} (admin only)"""
+    err = _require_admin()
+    if err:
+        return err
     data = request.get_json() or {}
     service_id = data.get('service_id', '')
 
-    if not service_id:
-        return {'error': 'service_id required'}, 400
+    if not _valid(_RX_DOCKER_REF, service_id):
+        return {'error': 'Valid service_id required'}, 400
 
-    if not all(c.isalnum() or c in '-_.' for c in service_id):
-        return {'error': 'Invalid service_id'}, 400
-
-    result = _docker_cmd(f'docker service update --force {service_id}')
+    result = _docker_cmd(f'docker service update --force {shlex.quote(service_id)}')
     if result is not None:
         log_audit(_get_username(), 'docker.service_restarted',
                   f'Force-updated service {service_id}')
-        with _cache_lock:
-            _cache.pop('services', None)
+        _invalidate('services')
         return {'success': True, 'message': f'Service {service_id} force-updated'}
     return {'error': 'Restart command failed'}, 500
 
 
 def _api_service_remove():
-    """POST — Remove a service. Body: {service_id}"""
+    """POST — Remove a service. Body: {service_id} (admin only)"""
     err = _require_admin()
     if err:
         return err
@@ -924,26 +1066,20 @@ def _api_service_remove():
     data = request.get_json() or {}
     service_id = data.get('service_id', '')
 
-    if not service_id:
-        return {'error': 'service_id required'}, 400
+    if not _valid(_RX_DOCKER_REF, service_id):
+        return {'error': 'Valid service_id required'}, 400
 
-    if not all(c.isalnum() or c in '-_.' for c in service_id):
-        return {'error': 'Invalid service_id'}, 400
-
-    result = _docker_cmd(f'docker service rm {service_id}')
+    result = _docker_cmd(f'docker service rm {shlex.quote(service_id)}')
     if result is not None:
         log_audit(_get_username(), 'docker.service_removed',
                   f'Removed service {service_id}')
-        with _cache_lock:
-            _cache.pop('services', None)
-            _cache.pop('stacks', None)
-            _cache.pop('overview', None)
+        _invalidate('all')
         return {'success': True, 'message': f'Service {service_id} removed'}
     return {'error': 'Remove command failed'}, 500
 
 
 def _api_stack_deploy():
-    """POST — Deploy/update a stack. Body: {stack_name, compose_yaml}"""
+    """POST — Deploy/update a stack. Body: {stack_name, compose_yaml} (admin only)"""
     err = _require_admin()
     if err:
         return err
@@ -954,32 +1090,44 @@ def _api_stack_deploy():
 
     if not stack_name or not compose:
         return {'error': 'stack_name and compose_yaml required'}, 400
-
-    if not all(c.isalnum() or c in '-_' for c in stack_name):
+    if not _valid(_RX_STACK_NAME, stack_name):
         return {'error': 'Invalid stack_name'}, 400
+    if not isinstance(compose, str) or len(compose) > 1024 * 1024:
+        return {'error': 'compose_yaml must be string ≤1MiB'}, 400
 
-    # Write compose to temp file on remote, deploy, cleanup
+    # Write compose to remote via mktemp (race-free, unguessable path), deploy, cleanup.
+    # The base64 payload itself contains no shell metacharacters.
     import base64
     b64 = base64.b64encode(compose.encode()).decode()
+    qname = shlex.quote(stack_name)
+    qb64 = shlex.quote(b64)
     cmd = (
-        f'echo "{b64}" | base64 -d > /tmp/_pegaprox_stack_{stack_name}.yml && '
-        f'docker stack deploy -c /tmp/_pegaprox_stack_{stack_name}.yml {stack_name} && '
-        f'rm -f /tmp/_pegaprox_stack_{stack_name}.yml'
+        f'set -e; '
+        f'tmpf=$(mktemp -t pegaprox_stack.XXXXXXXX) && '
+        f'chmod 600 "$tmpf" && '
+        f'printf %s {qb64} | base64 -d > "$tmpf" && '
+        f'trap "rm -f \\"$tmpf\\"" EXIT; '
+        f'docker stack deploy -c "$tmpf" {qname}'
     )
     result = _docker_cmd(cmd)
     if result is not None:
         log_audit(_get_username(), 'docker.stack_deployed', f'Deployed stack {stack_name}')
-        with _cache_lock:
-            _cache.clear()
+        _invalidate('all')
         return {'success': True, 'message': result}
     return {'error': 'Stack deploy failed'}, 500
 
 
 def _api_stack_detail():
-    """GET — Detailed info for a stack. ?name=xxx"""
+    """GET — Detailed info for a stack. ?name=xxx[&unmask=1]
+    Env vars masked unless admin requests unmask."""
     name = request.args.get('name', '')
-    if not name or not all(c.isalnum() or c in '-_' for c in name):
+    if not _valid(_RX_STACK_NAME, name):
         return {'error': 'Valid stack name required'}, 400
+    want_unmask = request.args.get('unmask', '').lower() in ('1', 'true', 'yes')
+    can_unmask = want_unmask and _is_admin()
+    if want_unmask and can_unmask:
+        log_audit(_get_username(), 'docker.stack_envs_unmasked',
+                  f'Viewed unmasked envs for stack {name}')
 
     # Get services for this stack
     services = _docker_json(
@@ -1005,7 +1153,8 @@ def _api_stack_detail():
             mode = spec.get('Mode', {})
             svc['image_full'] = container_spec.get('Image', '').split('@')[0]
             svc['env_count'] = len(container_spec.get('Env', []))
-            svc['env_vars'] = container_spec.get('Env', [])
+            svc['env_vars'] = _mask_env_list(container_spec.get('Env', []), unmask=can_unmask)
+            svc['env_masked'] = not can_unmask
             svc['mounts'] = container_spec.get('Mounts', [])
             svc['ports_detail'] = endpoint.get('Ports', [])
             svc['constraints'] = task_tmpl.get('Placement', {}).get('Constraints', [])
@@ -1034,9 +1183,13 @@ def _api_stack_detail():
 
 
 def _api_stack_compose():
-    """GET — Get the compose/config for a stack (reconstructed). ?name=xxx"""
+    """GET — Get the compose/config for a stack (reconstructed). ?name=xxx
+    Admin-only because the reconstructed YAML embeds env vars (potential secrets)."""
+    err = _require_admin()
+    if err:
+        return err
     name = request.args.get('name', '')
-    if not name or not all(c.isalnum() or c in '-_' for c in name):
+    if not _valid(_RX_STACK_NAME, name):
         return {'error': 'Valid stack name required'}, 400
 
     # docker stack config is not available in older Docker versions
@@ -1166,90 +1319,112 @@ def _api_stack_logs():
     return {'logs': '\n\n'.join(all_logs), 'stack': name, 'services': len(services)}
 
 
+def _stack_state_path(stack_name):
+    """Return absolute path for the local state file of a stack. stack_name MUST be pre-validated."""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    return os.path.join(STATE_DIR, f'stack_{stack_name}.json')
+
+
 def _api_stack_stop():
-    """POST — Stop a stack by scaling all replicated services to 0. Body: {stack_name}
-    Saves current replica counts so they can be restored with stack-start."""
+    """POST — Stop a stack by scaling all replicated services to 0. Body: {stack_name} (admin only)
+    Saves current replica counts locally so they can be restored with stack-start."""
+    err = _require_admin()
+    if err:
+        return err
     data = request.get_json() or {}
     stack_name = data.get('stack_name', '')
-    if not stack_name or not all(c.isalnum() or c in '-_' for c in stack_name):
+    if not _valid(_RX_STACK_NAME, stack_name):
         return {'error': 'Valid stack_name required'}, 400
 
     services = _docker_json(
-        f'docker service ls --filter label=com.docker.stack.namespace={stack_name} --format "{{{{json .}}}}"'
+        f'docker service ls --filter label=com.docker.stack.namespace={shlex.quote(stack_name)} --format "{{{{json .}}}}"'
     ) or []
 
     saved_replicas = {}
     scaled = 0
     for svc in services:
         svc_name = svc.get('Name', '')
+        if not _valid(_RX_DOCKER_REF, svc_name):
+            continue
         replicas_str = svc.get('Replicas', '0/0')
-        # Parse "3/3" → desired=3
         parts = replicas_str.split('/')
         desired = int(parts[-1]) if parts[-1].isdigit() else 0
         saved_replicas[svc_name] = desired
 
         if desired > 0:
-            result = _docker_cmd(f'docker service scale {svc_name}=0')
+            result = _docker_cmd(f'docker service scale {shlex.quote(svc_name)}=0')
             if result is not None:
                 scaled += 1
 
-    # Save replica counts to a temp file on remote for later restore
-    import base64
-    replica_json = json.dumps(saved_replicas)
-    b64 = base64.b64encode(replica_json.encode()).decode()
-    _docker_cmd(f'echo "{b64}" | base64 -d > /tmp/_pegaprox_stack_replicas_{stack_name}.json')
+    # Save replica counts LOCALLY in the plugin state dir (not in /tmp on remote)
+    try:
+        with open(_stack_state_path(stack_name), 'w') as f:
+            json.dump({'saved_at': datetime.now().isoformat(), 'replicas': saved_replicas}, f)
+        try:
+            os.chmod(_stack_state_path(stack_name), 0o600)
+        except Exception:
+            pass
+    except Exception as e:
+        log.warning(f"[{PLUGIN_ID}] could not persist stack state: {e}")
 
     log_audit(_get_username(), 'docker.stack_stopped', f'Stopped stack {stack_name} ({scaled} services scaled to 0)')
-    with _cache_lock:
-        _cache.pop('services', None)
-        _cache.pop('stacks', None)
-        _cache.pop('overview', None)
+    _invalidate('all')
 
     return {'success': True, 'message': f'Stack {stack_name} stopped ({scaled} services scaled to 0)', 'saved_replicas': saved_replicas}
 
 
 def _api_stack_start():
-    """POST — Start a stack by restoring saved replica counts. Body: {stack_name}"""
+    """POST — Start a stack by restoring saved replica counts. Body: {stack_name} (admin only)"""
+    err = _require_admin()
+    if err:
+        return err
     data = request.get_json() or {}
     stack_name = data.get('stack_name', '')
-    if not stack_name or not all(c.isalnum() or c in '-_' for c in stack_name):
+    if not _valid(_RX_STACK_NAME, stack_name):
         return {'error': 'Valid stack_name required'}, 400
 
-    # Try to read saved replicas
-    raw = _docker_cmd(f'cat /tmp/_pegaprox_stack_replicas_{stack_name}.json 2>/dev/null')
+    # Read saved replicas from LOCAL state file (no /tmp shenanigans)
     saved_replicas = {}
-    if raw:
+    state_file = _stack_state_path(stack_name)
+    if os.path.isfile(state_file):
         try:
-            saved_replicas = json.loads(raw)
-        except json.JSONDecodeError:
-            pass
+            with open(state_file) as f:
+                doc = json.load(f)
+                saved_replicas = doc.get('replicas', {}) if isinstance(doc, dict) else {}
+        except Exception as e:
+            log.warning(f"[{PLUGIN_ID}] could not read stack state: {e}")
 
     # If no saved state, default all replicated services to 1
     if not saved_replicas:
         services = _docker_json(
-            f'docker service ls --filter label=com.docker.stack.namespace={stack_name} --format "{{{{json .}}}}"'
+            f'docker service ls --filter label=com.docker.stack.namespace={shlex.quote(stack_name)} --format "{{{{json .}}}}"'
         ) or []
         for svc in services:
-            saved_replicas[svc.get('Name', '')] = 1
+            sname = svc.get('Name', '')
+            if _valid(_RX_DOCKER_REF, sname):
+                saved_replicas[sname] = 1
 
     started = 0
     for svc_name, replicas in saved_replicas.items():
+        if not _valid(_RX_DOCKER_REF, svc_name):
+            continue
+        try:
+            replicas = int(replicas)
+        except (TypeError, ValueError):
+            continue
         if replicas > 0:
-            result = _docker_cmd(f'docker service scale {svc_name}={replicas}')
+            result = _docker_cmd(f'docker service scale {shlex.quote(svc_name)}={replicas}')
             if result is not None:
                 started += 1
 
     log_audit(_get_username(), 'docker.stack_started', f'Started stack {stack_name} ({started} services restored)')
-    with _cache_lock:
-        _cache.pop('services', None)
-        _cache.pop('stacks', None)
-        _cache.pop('overview', None)
+    _invalidate('all')
 
     return {'success': True, 'message': f'Stack {stack_name} started ({started} services restored)', 'replicas': saved_replicas}
 
 
 def _api_stack_remove():
-    """POST — Remove a stack. Body: {stack_name}"""
+    """POST — Remove a stack. Body: {stack_name} (admin only)"""
     err = _require_admin()
     if err:
         return err
@@ -1257,40 +1432,44 @@ def _api_stack_remove():
     data = request.get_json() or {}
     stack_name = data.get('stack_name', '')
 
-    if not stack_name:
-        return {'error': 'stack_name required'}, 400
+    if not _valid(_RX_STACK_NAME, stack_name):
+        return {'error': 'Valid stack_name required'}, 400
 
-    if not all(c.isalnum() or c in '-_' for c in stack_name):
-        return {'error': 'Invalid stack_name'}, 400
-
-    result = _docker_cmd(f'docker stack rm {stack_name}')
+    result = _docker_cmd(f'docker stack rm {shlex.quote(stack_name)}')
     if result is not None:
         log_audit(_get_username(), 'docker.stack_removed', f'Removed stack {stack_name}')
-        with _cache_lock:
-            _cache.clear()
+        # Drop locally-saved state so a future re-deploy starts clean
+        try:
+            sf = _stack_state_path(stack_name)
+            if os.path.isfile(sf):
+                os.remove(sf)
+        except Exception:
+            pass
+        _invalidate('all')
         return {'success': True, 'message': f'Stack {stack_name} removed'}
     return {'error': 'Stack remove failed'}, 500
 
 
 def _api_container_action():
-    """POST — Container action. Body: {container_id, action, host (optional)}
+    """POST — Container action. Body: {container_id, action, host (optional)} (admin only)
     Actions: start, stop, restart, kill, pause, unpause, remove"""
+    err = _require_admin()
+    if err:
+        return err
     data = request.get_json() or {}
     container_id = data.get('container_id', '')
     action = data.get('action', '')
     host = data.get('host', '')  # target node IP
 
     valid_actions = ('start', 'stop', 'restart', 'kill', 'pause', 'unpause', 'remove')
-    if not container_id or action not in valid_actions:
-        return {'error': f'container_id and action ({"/".join(valid_actions)}) required'}, 400
+    if action not in valid_actions:
+        return {'error': f'action must be one of {"/".join(valid_actions)}'}, 400
+    if not _valid(_RX_DOCKER_REF, container_id):
+        return {'error': 'Valid container_id required'}, 400
 
-    if not all(c.isalnum() or c in '-_.' for c in container_id):
-        return {'error': 'Invalid container_id'}, 400
+    qid = shlex.quote(container_id)
+    cmd = f'docker rm -f {qid}' if action == 'remove' else f'docker {action} {qid}'
 
-    # Map action to docker command
-    cmd = f'docker rm -f {container_id}' if action == 'remove' else f'docker {action} {container_id}'
-
-    # If host specified, execute on that specific node
     if host:
         cfg = _load_config()
         target = next((h for h in cfg.get('swarm_hosts', []) if h['host'] == host), None)
@@ -1309,23 +1488,24 @@ def _api_container_action():
 
 
 def _api_node_action():
-    """POST — Node action. Body: {node_id, action: drain|active|pause}"""
+    """POST — Node action. Body: {node_id, action: drain|active|pause} (admin only)"""
+    err = _require_admin()
+    if err:
+        return err
     data = request.get_json() or {}
     node_id = data.get('node_id', '')
     action = data.get('action', '')
 
-    if not node_id or action not in ('drain', 'active', 'pause'):
-        return {'error': 'node_id and action (drain/active/pause) required'}, 400
+    if action not in ('drain', 'active', 'pause'):
+        return {'error': 'action must be drain|active|pause'}, 400
+    if not _valid(_RX_DOCKER_REF, node_id):
+        return {'error': 'Valid node_id required'}, 400
 
-    if not all(c.isalnum() or c in '-_.' for c in node_id):
-        return {'error': 'Invalid node_id'}, 400
-
-    result = _docker_cmd(f'docker node update --availability {action} {node_id}')
+    result = _docker_cmd(f'docker node update --availability {action} {shlex.quote(node_id)}')
     if result is not None:
         log_audit(_get_username(), f'docker.node_{action}',
                   f'Set node {node_id} to {action}')
-        with _cache_lock:
-            _cache.pop('nodes', None)
+        _invalidate('nodes')
         return {'success': True, 'message': f'Node {node_id} set to {action}'}
     return {'error': f'Node update failed'}, 500
 
@@ -1392,8 +1572,21 @@ def _api_save_config():
     return {'success': True}
 
 
+_RX_HOSTNAME = re.compile(
+    r'^(?:[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?'
+    r'(?:\.[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?)*'
+    r'|(?:\d{1,3}\.){3}\d{1,3}'
+    r')$'
+)
+_RX_USERNAME = re.compile(r'^[A-Za-z_][A-Za-z0-9_\-]{0,31}$')
+
 def _api_test_connection():
-    """POST — Test SSH connection to a host. Body: {host, user, key_file?, password?}"""
+    """POST — Test SSH connection to a host. Body: {host, user, key_file?, password?} (admin only)
+    Admin-only because this endpoint can be abused as an SSRF/credential-spray oracle
+    against arbitrary internal hosts."""
+    err = _require_admin()
+    if err:
+        return err
     data = request.get_json() or {}
     host = data.get('host', '')
     user = data.get('user', '')
@@ -1402,6 +1595,10 @@ def _api_test_connection():
 
     if not host or not user:
         return {'error': 'host and user required'}, 400
+    if not _valid(_RX_HOSTNAME, host):
+        return {'error': 'Invalid host (must be hostname or IPv4)'}, 400
+    if not _valid(_RX_USERNAME, user):
+        return {'error': 'Invalid user'}, 400
     if not key_file and not password:
         return {'error': 'key_file or password required'}, 400
 
@@ -1432,26 +1629,27 @@ def _api_serve_ui():
 
 
 def _api_image_pull():
-    """POST — Pull an image on a specific node. Body: {image, host}"""
+    """POST — Pull an image on a specific node. Body: {image, host} (admin only)"""
+    err = _require_admin()
+    if err:
+        return err
     data = request.get_json() or {}
     image = data.get('image', '')
     host = data.get('host', '')
-    if not image:
-        return {'error': 'image required'}, 400
-    # Sanitize image name
-    if any(c in image for c in [';', '&', '|', '`', '$']):
-        return {'error': 'Invalid image name'}, 400
+    if not _valid(_RX_IMAGE_REF, image):
+        return {'error': 'Invalid image ref'}, 400
 
+    qimg = shlex.quote(image)
     if host:
         cfg = _load_config()
         target = next((h for h in cfg.get('swarm_hosts', []) if h['host'] == host), None)
         if target:
-            out, err, code = _ssh_exec(target, command=f'docker pull {image} 2>&1', timeout=120)
+            out, err_out, code = _ssh_exec(target, command=f'docker pull {qimg} 2>&1', timeout=120)
             if code == 0:
                 log_audit(_get_username(), 'docker.image_pull', f'Pulled {image} on {host}')
                 return {'success': True, 'message': out}
-            return {'error': err or out}, 500
-    result = _docker_cmd(f'docker pull {image} 2>&1')
+            return {'error': err_out or out}, 500
+    result = _docker_cmd(f'docker pull {qimg} 2>&1')
     if result is not None:
         log_audit(_get_username(), 'docker.image_pull', f'Pulled {image}')
         return {'success': True, 'message': result}
@@ -1459,16 +1657,17 @@ def _api_image_pull():
 
 
 def _api_image_remove():
-    """POST — Remove image(s). Body: {image_id, host}"""
+    """POST — Remove image(s). Body: {image_id, host} (admin only)"""
+    err = _require_admin()
+    if err:
+        return err
     data = request.get_json() or {}
     image_id = data.get('image_id', '')
     host = data.get('host', '')
-    if not image_id:
-        return {'error': 'image_id required'}, 400
-    if not all(c.isalnum() or c in '-_.:/' for c in image_id):
+    if not _valid(_RX_IMAGE_REF, image_id):
         return {'error': 'Invalid image_id'}, 400
 
-    cmd = f'docker rmi {image_id} 2>&1'
+    cmd = f'docker rmi {shlex.quote(image_id)} 2>&1'
     if host:
         cfg = _load_config()
         target = next((h for h in cfg.get('swarm_hosts', []) if h['host'] == host), None)
@@ -1485,14 +1684,17 @@ def _api_image_remove():
 
 
 def _api_volume_remove():
-    """POST — Remove volume. Body: {volume_name, host}"""
+    """POST — Remove volume. Body: {volume_name, host} (admin only)"""
+    err = _require_admin()
+    if err:
+        return err
     data = request.get_json() or {}
     name = data.get('volume_name', '')
     host = data.get('host', '')
-    if not name or not all(c.isalnum() or c in '-_.' for c in name):
+    if not _valid(_RX_DOCKER_REF, name):
         return {'error': 'Valid volume_name required'}, 400
 
-    cmd = f'docker volume rm {name} 2>&1'
+    cmd = f'docker volume rm {shlex.quote(name)} 2>&1'
     if host:
         cfg = _load_config()
         target = next((h for h in cfg.get('swarm_hosts', []) if h['host'] == host), None)
@@ -1509,12 +1711,15 @@ def _api_volume_remove():
 
 
 def _api_network_remove():
-    """POST — Remove network. Body: {network_name}"""
+    """POST — Remove network. Body: {network_name} (admin only)"""
+    err = _require_admin()
+    if err:
+        return err
     data = request.get_json() or {}
     name = data.get('network_name', '')
-    if not name or not all(c.isalnum() or c in '-_.' for c in name):
+    if not _valid(_RX_DOCKER_REF, name):
         return {'error': 'Valid network_name required'}, 400
-    result = _docker_cmd(f'docker network rm {name} 2>&1')
+    result = _docker_cmd(f'docker network rm {shlex.quote(name)} 2>&1')
     if result is not None:
         log_audit(_get_username(), 'docker.network_removed', f'Removed network {name}')
         return {'success': True, 'message': result}
@@ -1551,20 +1756,21 @@ def _api_topology():
         parts = replicas.split('/')
         running = int(parts[0]) if parts[0].isdigit() else 0
 
-        # Assign to a node (use constraints or round-robin)
+        # Assign to a node (use constraints or deterministic crc32-based round-robin).
+        # zlib.crc32 is deterministic across processes/restarts (unlike hash()).
         node_name = ''
         constraints = svc.get('constraints', [])
         for c in constraints:
             if 'node.hostname' in c and '==' in c:
                 node_name = c.split('==')[-1].strip()
                 break
+        svc_crc = zlib.crc32(svc_name.encode('utf-8'))
         if not node_name and topo_nodes:
-            # Round-robin assignment for visualization
-            idx = hash(svc_name) % len(topo_nodes)
+            idx = svc_crc % len(topo_nodes)
             node_name = topo_nodes[idx]['name']
 
         topo_resources.append({
-            'vmid': hash(svc_name) % 9000 + 1000,
+            'vmid': svc_crc % 9000 + 1000,
             'name': svc_name.split('_')[-1] if '_' in svc_name else svc_name,
             'type': 'lxc',  # show as container icon
             'status': 'running' if running > 0 else 'stopped',
@@ -1730,24 +1936,47 @@ def _api_load_balance():
     host_order = {h['host']: i for i, h in enumerate(hosts)}
     nodes_data.sort(key=lambda n: host_order.get(n['host'], 99))
 
-    # Calculate balance score (100 = perfect, 0 = all on one node)
+    # Calculate balance score.
+    #   - 100 = tasks evenly distributed across all healthy nodes
+    #   - 0 = pathological (all tasks on a single node, or only one healthy node in a multi-node cluster)
+    # Healthy = no error AND availability is "active" if reported. We include healthy nodes with
+    # zero tasks so the average reflects the *capacity* of the cluster, not just the busy nodes.
     total_tasks = sum(n['tasks_running'] for n in nodes_data)
-    active_nodes = [n for n in nodes_data if n['tasks_running'] > 0 or not n.get('error')]
+    healthy_nodes = [n for n in nodes_data if not n.get('error')]
+    nodes_with_tasks = [n for n in healthy_nodes if n['tasks_running'] > 0]
 
     balance_score = 100
     recommendation = None
-    if total_tasks > 0 and len(active_nodes) > 1:
-        avg = total_tasks / len(active_nodes)
-        variance = sum((n['tasks_running'] - avg) ** 2 for n in active_nodes) / len(active_nodes)
-        std_dev = math.sqrt(variance)
-        # Normalize: score = 100 when std_dev=0, drops towards 0
-        balance_score = max(0, round(100 - (std_dev / max(avg, 1)) * 100))
+    if total_tasks > 0:
+        if len(healthy_nodes) <= 1:
+            # Only one healthy node serving tasks → not balanced regardless of "tasks per node"
+            balance_score = 0
+            recommendation = (
+                f"Sólo {len(healthy_nodes)} nodo activo: el cluster no está repartiendo carga"
+                if len(healthy_nodes) == 1 else
+                "No hay nodos activos sirviendo tasks"
+            )
+        elif len(nodes_with_tasks) == 1 and len(healthy_nodes) > 1:
+            # Multiple nodes available, but every task is on one — explicit worst case
+            balance_score = 0
+            only = nodes_with_tasks[0]
+            recommendation = (
+                f"{only['name']} concentra el 100% de los tasks "
+                f"({only['tasks_running']}) — los demás nodos están desocupados"
+            )
+        else:
+            avg = total_tasks / len(healthy_nodes)
+            variance = sum((n['tasks_running'] - avg) ** 2 for n in healthy_nodes) / len(healthy_nodes)
+            std_dev = math.sqrt(variance)
+            balance_score = max(0, round(100 - (std_dev / max(avg, 1)) * 100))
 
-        # Find most overloaded node
-        max_node = max(active_nodes, key=lambda n: n['tasks_running'])
-        if max_node['tasks_running'] > avg * 1.3:
-            pct_over = round(((max_node['tasks_running'] - avg) / avg) * 100)
-            recommendation = f"{max_node['name']} tiene {pct_over}% más tasks que el promedio ({max_node['tasks_running']} vs {avg:.0f})"
+            max_node = max(healthy_nodes, key=lambda n: n['tasks_running'])
+            if max_node['tasks_running'] > avg * 1.3 and avg > 0:
+                pct_over = round(((max_node['tasks_running'] - avg) / avg) * 100)
+                recommendation = (
+                    f"{max_node['name']} tiene {pct_over}% más tasks que el promedio "
+                    f"({max_node['tasks_running']} vs {avg:.0f})"
+                )
 
     return {
         'nodes': nodes_data,
@@ -1759,19 +1988,20 @@ def _api_load_balance():
 
 
 def _api_rebalance_service():
-    """POST — Force rebalance a service. Body: {service_name}"""
+    """POST — Force rebalance a service. Body: {service_name} (admin only)"""
     err = _require_admin()
     if err:
         return err
     data = request.get_json() or {}
     service_name = data.get('service_name', '')
-    if not service_name or not all(c.isalnum() or c in '-_.' for c in service_name):
+    if not _valid(_RX_DOCKER_REF, service_name):
         return {'error': 'Valid service_name required'}, 400
 
-    result = _docker_cmd(f'docker service update --force {service_name} 2>&1')
+    result = _docker_cmd(f'docker service update --force {shlex.quote(service_name)} 2>&1')
     if result is not None:
         log_audit(_get_username(), 'docker.service_rebalance',
                   f'Force rebalanced service {service_name}')
+        _invalidate('services')
         return {'success': True, 'message': f'Service {service_name} rebalancing'}
     return {'error': 'Rebalance failed'}, 500
 

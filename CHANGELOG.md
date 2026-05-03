@@ -4,6 +4,104 @@ All notable changes to the PegaProx Docker Swarm plugin are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This
 project follows Semantic Versioning.
 
+## [1.9.4] — 2026-05-02
+
+Security & correctness pass. **Recommend everyone upgrade.**
+
+### Fixed — security (critical)
+
+- **RBAC**: every state-mutating endpoint now requires admin. Previously the
+  following were callable by any authenticated PegaProx user with `plugins.view`:
+  `service-scale`, `service-restart`, `service-rollback`, `service-update`,
+  `container-action` (incl. `rm -f`), `node-action` (drain/active/pause),
+  `image-pull`, `image-remove`, `volume-remove`, `network-remove`, `stack-stop`,
+  `stack-start`, `rebalance-service`, `test-connection`. `stack-compose` is
+  also admin-only now because the reconstructed YAML embeds env vars.
+- **Command injection** in `service-update`: `image`, `limit_cpu`,
+  `limit_memory`, `env_add[]` and `env_rm[]` were interpolated raw into the
+  shell command. A body like `{"image": "x; rm -rf / #"}` would execute as
+  the SSH user on the manager. All user-controlled args are now validated
+  against allowlist regexes and `shlex.quote`'d. Same fix applied to
+  `image-pull`, `image-remove`, `volume-remove`, `network-remove`,
+  `service-rollback`, `service-restart`, `service-scale`, `service-remove`,
+  `node-action`, `container-action`, `stack-deploy`, `stack-stop`,
+  `stack-start`, `stack-remove`, `rebalance-service`.
+- **SSH host-key TOFU + persistence** replaces silent `AutoAddPolicy()`.
+  Host keys are recorded in `<plugin>/known_hosts` (mode 0600) on first
+  contact; later mismatches are rejected by paramiko (`BadHostKeyException`),
+  catching MITM attempts after the first connection. Previously, anyone
+  who could redirect TCP to a Swarm manager IP could harvest the SSH
+  password we sent.
+- **Path traversal in `/tmp`**: `stack-deploy` no longer writes to a
+  predictable `/tmp/_pegaprox_stack_<name>.yml` (where any local user could
+  pre-create a symlink to overwrite arbitrary files). It now uses
+  `mktemp(1)` on the remote and cleans up via `trap`. Stack stop/start
+  state was being persisted to `/tmp/_pegaprox_stack_replicas_<name>.json`,
+  also predictable; that state now lives **locally** under
+  `<plugin>/state/stack_<name>.json` (mode 0600) and is cleared when the
+  stack is removed.
+- **`test-connection` is admin-only**. Before, any authenticated user could
+  abuse this endpoint to make the PegaProx server SSH-connect to arbitrary
+  internal IPs with arbitrary credentials — a clean SSRF + credential-spray
+  oracle. Host and user inputs are now also strictly validated.
+- **Server-side env masking**. `service-detail` and `stack-detail` previously
+  returned env vars in plaintext; the UI masked them client-side, so any
+  user could read them with DevTools. Sensitive keys (matching
+  `password|secret|token|apikey|jwt|bearer|auth|private|credential|dsn|
+  passwd|passphrase`) are now masked server-side. Admins can request
+  `?unmask=1` to view the real values; each unmask is logged via
+  `log_audit`.
+
+### Fixed — correctness
+
+- **`balance_score` was wrong in three edge cases**:
+  - 1 healthy node out of N configured: previously returned 100
+    ("perfect balance") when in fact nothing is being balanced; now
+    returns 0 with a recommendation explaining the situation.
+  - All tasks concentrated on a single node (others healthy but idle):
+    previously returned a high score because the std-dev calc skipped
+    when "only one active node"; now returns 0 with a clear
+    recommendation naming the saturated node.
+  - The "active nodes" filter is now "healthy nodes" (no error). Idle
+    healthy nodes count toward the average, so cluster *capacity* is
+    reflected, not just the busy subset.
+
+- **`docker_swarm.topology` determinism**: service→node fallback assignment
+  used `hash(svc_name) % len(nodes)`, which changes between processes
+  because Python randomises `hash()` (PYTHONHASHSEED). The topology view
+  showed services on different nodes after every restart. Replaced with
+  `zlib.crc32` (deterministic across processes/restarts).
+
+- **`poll_interval` now reloaded each iteration** of the background poll
+  loop. Previously it was read once at thread start, so changing the
+  setting from the UI required a plugin restart to take effect.
+
+- **Cache invalidation** on mutations is now centralised in
+  `_invalidate(domain)`. Mutations to services also invalidate `overview`
+  and `stacks` (and vice versa). Previously some mutations only cleared
+  one cache key, so the UI showed stale data for up to 8s after an
+  action across tabs.
+
+### Added
+
+- `_invalidate(domain)` cache helper.
+- `_PersistentTOFUPolicy` paramiko host-key policy that auto-saves to
+  `known_hosts` on first contact.
+- `state/` subdirectory under the plugin for non-secret persistent state
+  (currently: stack stop/start replica counts).
+- Admin "Show real values" / "Hide" toggle in the service-detail Env tab
+  (calls `?unmask=1`, audited).
+- `api()` helper now surfaces HTTP status as `_http` and translates
+  403 to a friendly Spanish message.
+
+### Internal
+
+- All input validators consolidated to module-level regexes
+  (`_RX_DOCKER_REF`, `_RX_STACK_NAME`, `_RX_IMAGE_REF`, `_RX_RESOURCE`,
+  `_RX_ENV_ENTRY`, `_RX_HOSTNAME`, `_RX_USERNAME`).
+- Replaced ad-hoc inline `all(c.isalnum() or c in '-_.')` checks with
+  `_valid(rx, s)` calls — cleaner and easier to audit.
+
 ## [1.9.3] — 2026-04-24
 
 ### Added — persistence layer (2 new defence-in-depth units)
