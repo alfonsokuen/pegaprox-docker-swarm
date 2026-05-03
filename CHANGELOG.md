@@ -4,6 +4,57 @@ All notable changes to the PegaProx Docker Swarm plugin are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This
 project follows Semantic Versioning.
 
+## [1.14.3] — 2026-05-03
+
+Resilience pass for the auto-patch / persistence layer, surfaced by a
+PegaProx core update that refactored `dashboard.js` and silently broke
+the sidebar integration. Previously the patcher reported success even
+though a `FATAL` from a sub-script was masked by a `python3 … | sed`
+pipeline (sed always exits 0). Combined with one upstream tweak (the
+topology useEffect's deps array gained a member) the result was a
+post-update with no Docker Swarm sidebar and no audible alarm.
+
+### Fixed
+
+- **`set -o pipefail` around every `python3 patch_*.py | sed` call** in
+  `patch-pegaprox.sh`. A FATAL inside a sub-patcher now actually fails
+  the run (real exit 1), instead of slipping past `if !`.
+- **Patch 4 (topology useEffect) is now anchor-resilient.** The deps
+  array variant (`[sidebarTopology]` vs `[sidebarTopology,
+  clusters.length]`) used to break the literal-string match. Now uses a
+  cascade: original literal → known new literal → regex on
+  `\}, \[sidebarTopology[^\]]*\]\);…`. The replace logic preserves the
+  upstream's exact spacing.
+- **VNC patches are now non-fatal.** They depend on internal anchors of
+  PegaProx's `vms.py` / `node_modals.js` and frequently break across
+  upstream refactors. Failure no longer aborts the whole patch run —
+  the dashboard/sidebar/iframe path completes, only VM console may be
+  affected. Logged as `YELLOW` warnings with a clear message.
+
+### Added — `_try_replace` helper in `patch_dashboard.py`
+
+```python
+_try_replace(content, candidates, new_template, label)
+# candidates: list of (kind, value) where kind in {'literal', 'regex'}
+# new_template: callable(matched_text) -> replacement string
+```
+
+Lets future patches list multiple anchors in priority order with a
+regex fallback, so a single upstream tweak doesn't require a hotfix.
+
+### Hardened — `auto-patch.sh`
+
+- 5 s settle delay before grepping markers (PegaProx writes multiple
+  files in a sequence that the path watcher fires on the first one).
+- Stale lock detection: a lock older than 10 min from a previous run
+  is cleared automatically. Lock now records PID + timestamp.
+- Two-pronged validation after the patch run: marker must be present in
+  BOTH `web/src/dashboard.js` (source) and `web/index.html`
+  (rebuilt bundle). If either is missing, exits non-zero so journal
+  shows the broken state instead of a fake "completed" line.
+
+---
+
 ## [1.14.2] — 2026-05-03
 
 Hotfix surfaced by the first end-to-end rebalance after v1.14.1: the worker

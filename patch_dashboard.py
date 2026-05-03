@@ -15,9 +15,17 @@ Behaviour v1.9 (2026-04-24):
         0 = already patched OR all 9 patches applied cleanly
         1 = I/O / argument error
         2 = anchor missing (PegaProx upstream changed structure)
+
+v1.14.3 (2026-05-03):
+  * `_try_replace` accepts a list of alternative anchors so a single upstream
+    tweak (e.g. dependency array gaining a member) doesn't break the patch.
+    Falls back to a regex when literal candidates all miss.
+  * Patch 4 (topology-useEffect) now uses regex on the `sidebarTopology`
+    deps array — survives further refactors of that effect.
 """
 
 import os
+import re
 import sys
 
 DASHBOARD = "/opt/PegaProx/web/src/dashboard.js"
@@ -42,6 +50,34 @@ def _require_rfind_replace(content, old, new, label):
     if idx < 0:
         _die("anchor missing for " + repr(label) + " (rfind) - upstream likely refactored")
     return content[:idx] + new + content[idx + len(old):]
+
+
+def _try_replace(content, candidates, new_template, label):
+    """Try a list of literal anchors, fall back to a regex.
+
+    candidates: list of (kind, value) where kind in {'literal', 'regex'}.
+    new_template: callable(matched_text) -> replacement string. Receives the
+                  matched literal anchor (or the regex match.group(0)) so the
+                  caller can inject context-preserving suffixes.
+    """
+    for kind, value in candidates:
+        if kind == 'literal':
+            if value in content:
+                replacement = new_template(value)
+                if value == replacement:
+                    _die("replace for " + repr(label) + " produced no change")
+                return content.replace(value, replacement, 1)
+        elif kind == 'regex':
+            m = re.search(value, content)
+            if m:
+                matched = m.group(0)
+                replacement = new_template(matched)
+                if matched == replacement:
+                    _die("replace for " + repr(label) + " produced no change")
+                return content[:m.start()] + replacement + content[m.end():]
+        else:
+            _die("invalid candidate kind " + repr(kind) + " for " + repr(label), code=1)
+    _die("no matching anchor for " + repr(label) + " (tried " + str(len(candidates)) + " variants) - upstream likely refactored")
 
 
 def main():
@@ -104,15 +140,22 @@ def main():
     )
     applied.append("3b condition:sidebar-active")
 
-    # 4. Topology fetch useEffect
-    topo_anchor = (
-        "}, [sidebarTopology]);\n"
-        "\n"
-        "            // LW: Feb 2026 - corporate sidebar inventory tree state"
-    )
-    topo_new = (
-        "}, [sidebarTopology]);\n"
-        "\n"
+    # 4. Topology fetch useEffect.
+    # The deps array of the topology useEffect changes upstream over time
+    # (originally `[sidebarTopology]`, later `[sidebarTopology, clusters.length]`).
+    # We anchor on "}, [sidebarTopology<anything>]);\n\n            //
+    # LW: Feb 2026 - corporate sidebar inventory tree state" — works regardless
+    # of additional deps. The DockerSwarm topology effect is inserted right
+    # after the matched anchor block.
+    # The matched anchor is "<closing of upstream useEffect>\n\n            // LW…tree state".
+    # We keep prefix + separator unchanged and insert our useEffect *before* the
+    # `// LW…` comment. End-result:
+    #     }, [sidebarTopology<deps>]);            <- upstream's closing
+    #
+    #         useEffect(() => { … }, [sidebarTopology]);    <- our effect
+    #
+    #             // LW: Feb 2026 - corporate sidebar inventory tree state
+    swarm_topo_effect = (
         "            useEffect(() => {\n"
         "                if (!sidebarTopology) return;\n"
         "                fetch('/api/plugins/docker_swarm/api/topology', {\n"
@@ -124,9 +167,28 @@ def main():
         "                    .catch(e => console.warn('[DockerSwarm] Topology fetch:', e));\n"
         "            }, [sidebarTopology]);\n"
         "\n"
-        "            // LW: Feb 2026 - corporate sidebar inventory tree state"
     )
-    content = _require_replace(content, topo_anchor, topo_new, "4 topology-useEffect")
+    LW_TREE = "// LW: Feb 2026 - corporate sidebar inventory tree state"
+    topo_candidates = [
+        # original literal (PegaProx 0.9.6.x)
+        ('literal', "}, [sidebarTopology]);\n\n            " + LW_TREE),
+        # post-2026-04 literal: deps array gained clusters.length
+        ('literal', "}, [sidebarTopology, clusters.length]);\n\n            " + LW_TREE),
+        # generic fallback: any deps array starting with sidebarTopology
+        ('regex', r"\}, \[sidebarTopology[^\]]*\]\);\s*\n\s*\n\s+" + re.escape(LW_TREE)),
+    ]
+
+    def _topo_replace(matched):
+        # matched = "<upstream-closing-of-useEffect>\n\n            // LW…"
+        # Insert swarm_topo_effect (already 12-space indented, ends in \n\n)
+        # right at the blank-line separator so spacing stays exact.
+        sep = matched.rfind("\n\n")
+        if sep < 0:
+            _die("topology anchor missing blank-line separator", code=2)
+        insert_at = sep + 2  # past the `\n\n`
+        return matched[:insert_at] + swarm_topo_effect + matched[insert_at:]
+
+    content = _try_replace(content, topo_candidates, _topo_replace, "4 topology-useEffect")
     applied.append("4 topology-useEffect")
 
     # 5. Sidebar section injected BEFORE the XHM sidebar marker

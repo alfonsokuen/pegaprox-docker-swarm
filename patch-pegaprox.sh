@@ -87,10 +87,12 @@ echo "[2/4] Dashboard patches (sidebar, topology, iframe)..."
 if grep -q "sidebarDockerSwarm" "$DASHBOARD"; then
     echo -e "      ${YELLOW}already patched${NC}"
 else
+    set -o pipefail
     if ! python3 "$PLUGIN_DIR/patch_dashboard.py" 2>&1 | sed 's/^/      /'; then
-        echo -e "      ${RED}patch_dashboard.py FAILED — aborting${NC}"
+        echo -e "      ${RED}patch_dashboard.py FAILED (rc=${PIPESTATUS[0]}) — aborting${NC}"
         exit 1
     fi
+    set +o pipefail
 fi
 
 # ---------- 3. VNC console modal fix — nginx sub_filter (PERMANENT) ----------
@@ -137,10 +139,15 @@ elif grep -q "DS-VNC-AUTH-CONTEXT" "$VMS_PY" && grep -q "DS-VNC-TICKET-PASSTHROU
 else
     cp -a "$VMS_PY" "$BACKUP_DIR/vms.py.pre-authctx.$(date +%Y%m%d-%H%M%S)"
     cp -a "$NODE_MODALS" "$BACKUP_DIR/node_modals.js.pre-authctx.$(date +%Y%m%d-%H%M%S)"
+    # v1.14.3: VNC patches are upstream-anchor-fragile but NOT critical for
+    # docker_swarm sidebar — if they fail, log loud and continue so the
+    # main integration still rebuilds. VNC console is optional.
+    set -o pipefail
     if ! python3 "$PLUGIN_DIR/patch_vnc_auth_context.py" 2>&1 | sed 's/^/      /'; then
-        echo -e "      ${RED}patch_vnc_auth_context.py FAILED — aborting${NC}"
-        exit 1
+        echo -e "      ${YELLOW}patch_vnc_auth_context.py FAILED (rc=${PIPESTATUS[0]}) — VM console may not work; sidebar continues${NC}"
+        VNC_PATCHES_FAILED=1
     fi
+    set +o pipefail
     if ! python3 -c "import ast; ast.parse(open('$VMS_PY').read())" 2>/dev/null; then
         echo -e "      ${RED}vms.py post-patch syntax check FAILED — restoring${NC}"
         cp -a "$BACKUP_DIR/vms.py.pre-authctx.$(date +%Y%m%d-%H%M%S)" "$VMS_PY"
@@ -166,10 +173,12 @@ elif grep -q "DS-VNC-SUBPROTOCOL" "$VMS_PY"; then
 else
     # Safety backup
     cp -a "$VMS_PY" "$BACKUP_DIR/vms.py.pre-vncfix.$(date +%Y%m%d-%H%M%S)"
+    set -o pipefail
     if ! python3 "$PLUGIN_DIR/patch_vnc_subprotocol.py" 2>&1 | sed 's/^/      /'; then
-        echo -e "      ${RED}patch_vnc_subprotocol.py FAILED — aborting${NC}"
-        exit 1
+        echo -e "      ${YELLOW}patch_vnc_subprotocol.py FAILED (rc=${PIPESTATUS[0]}) — VM console may not work; sidebar continues${NC}"
+        VNC_PATCHES_FAILED=1
     fi
+    set +o pipefail
     # Syntax sanity (this file is 6000+ lines of PegaProx core, we must not bork it)
     if ! python3 -c "import ast; ast.parse(open('$VMS_PY').read())" 2>/dev/null; then
         echo -e "      ${RED}post-patch syntax check FAILED — restoring backup${NC}"
