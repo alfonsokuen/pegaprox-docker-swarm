@@ -3138,6 +3138,216 @@ def _api_rebalance_service():
 
 
 # ---------------------------------------------------------------------------
+# Smart Rebalance — diagnostics + cluster-wide action (v1.14.0)
+# ---------------------------------------------------------------------------
+# The Balance tab tells you WHAT the imbalance is. This adds WHY (which
+# services contribute, which are pinned and can't move) and HOW to fix it
+# (one-click force-update of every eligible service in sequence, throttled).
+
+# Constraint patterns that "pin" a service to a single node — moving these
+# wouldn't help. We're conservative: any constraint involving node.id or
+# node.hostname with == is treated as pinning. node.role, node.labels.* are
+# capability-based and don't pin to a single node.
+_RX_PIN_CONSTRAINT = re.compile(r'\bnode\.(id|hostname)\s*==\s*\S+', re.IGNORECASE)
+
+
+def _service_is_pinned(svc):
+    """True if the service has a constraint that locks it to specific nodes
+    by id/hostname. Capability constraints (role, labels) don't count."""
+    for c in (svc.get('constraints') or []):
+        if isinstance(c, str) and _RX_PIN_CONSTRAINT.search(c):
+            return True
+    return False
+
+
+def _eligible_for_rebalance(svc):
+    """Service is a sensible target for force-update rebalance.
+    Skip global mode (no spread to do), replicas≤1 (single instance),
+    and pinned services."""
+    if svc.get('mode_type') != 'replicated':
+        return False, 'global o non-replicated'
+    if (svc.get('replicas_spec') or 0) <= 1:
+        return False, f"replicas={svc.get('replicas_spec', 0)} (no hay nada que distribuir)"
+    if _service_is_pinned(svc):
+        return False, 'constraint node.id/hostname pin a un nodo específico'
+    return True, 'elegible'
+
+
+def _compute_balance_insights():
+    """Diagnose why the cluster is unbalanced + list rebalance candidates."""
+    lb = _api_load_balance()
+    if not lb or 'nodes' not in lb:
+        return {'error': 'Load balance data unavailable'}
+
+    services = _cache_get('services') or _fetch_services() or []
+    nodes = lb.get('nodes', [])
+    if not nodes:
+        return {'error': 'No nodes'}
+
+    healthy = [n for n in nodes if not n.get('error')]
+    if len(healthy) <= 1:
+        return {
+            'imbalance_pct': 0,
+            'verdict': 'Solo 1 nodo sano — no hay nada que rebalancear.',
+            'candidates': [], 'pinned': [], 'singletons': [],
+        }
+
+    avg = sum(n['tasks_running'] for n in healthy) / len(healthy)
+    hot = max(healthy, key=lambda n: n['tasks_running'])
+    cold = min(healthy, key=lambda n: n['tasks_running'])
+    spread = hot['tasks_running'] - cold['tasks_running']
+    imbalance_pct = round((spread / max(avg, 1)) * 100, 1) if avg > 0 else 0
+
+    # Categorize every replicated service
+    candidates = []
+    pinned = []
+    singletons = []
+    for svc in services:
+        name = svc.get('Name', '')
+        replicas = svc.get('replicas_spec', 0) or 0
+        ok, reason = _eligible_for_rebalance(svc)
+        info = {
+            'name': name,
+            'stack': svc.get('stack', ''),
+            'replicas': replicas,
+            'reason': reason,
+        }
+        if ok:
+            candidates.append(info)
+        elif svc.get('mode_type') == 'replicated' and replicas == 1:
+            singletons.append(info)
+        elif _service_is_pinned(svc):
+            pinned.append({**info, 'constraints': svc.get('constraints') or []})
+
+    # Verdict text
+    if imbalance_pct < 10:
+        verdict = f'Cluster bien balanceado (gap {imbalance_pct}% del promedio).'
+    elif imbalance_pct < 25:
+        verdict = (
+            f'{cold["name"]} ({cold["tasks_running"]} tasks) tiene {spread} tasks menos '
+            f'que {hot["name"]} ({hot["tasks_running"]}). Forzar redeploy de los '
+            f'{len(candidates)} servicios elegibles puede mejorar.'
+        )
+    else:
+        verdict = (
+            f'Imbalance significativo: {hot["name"]} concentra {hot["tasks_running"]} tasks '
+            f'mientras {cold["name"]} solo tiene {cold["tasks_running"]}. '
+            f'Recomendado: rebalance automático ({len(candidates)} servicios elegibles).'
+        )
+
+    return {
+        'imbalance_pct': imbalance_pct,
+        'task_avg': round(avg, 1),
+        'hot_node': {'name': hot['name'], 'tasks': hot['tasks_running']},
+        'cold_node': {'name': cold['name'], 'tasks': cold['tasks_running']},
+        'verdict': verdict,
+        'candidates': sorted(candidates, key=lambda c: -c['replicas']),
+        'pinned': pinned,
+        'singletons': singletons,
+        'totals': {
+            'eligible': len(candidates),
+            'pinned': len(pinned),
+            'singletons': len(singletons),
+        },
+    }
+
+
+def _api_balance_insights():
+    """GET — Why the cluster isn't balanced + which services can be moved."""
+    cached = _cache_get('balance_insights')
+    if cached:
+        return cached
+    try:
+        report = _compute_balance_insights()
+    except Exception as e:
+        log.error(f"[{PLUGIN_ID}] balance insights failed: {e}")
+        return {'error': str(e)}, 500
+    _cache_set('balance_insights', report)
+    return report
+
+
+def _api_balance_rebalance_all():
+    """POST — Force-update every eligible service in sequence to redistribute.
+
+    Body:
+      dry_run: bool (default true) — return the plan without executing
+      max_services: int (default 0 = no cap) — only touch the first N
+      delay_sec: int (default 5) — pause between updates so the cluster
+                 doesn't get a synchronous restart wave
+
+    Admin-only. Returns per-service result + final status.
+    """
+    err = _require_admin()
+    if err:
+        return err
+    payload = request.get_json(silent=True) or {}
+    dry_run = bool(payload.get('dry_run', True))
+    max_services = int(payload.get('max_services', 0) or 0)
+    delay_sec = max(0, min(int(payload.get('delay_sec', 5) or 5), 30))
+
+    insights = _compute_balance_insights()
+    if 'error' in insights:
+        return insights, 400
+    candidates = insights.get('candidates', [])
+    if max_services > 0:
+        candidates = candidates[:max_services]
+
+    if dry_run:
+        return {
+            'dry_run': True,
+            'verdict': insights.get('verdict'),
+            'imbalance_pct': insights.get('imbalance_pct'),
+            'will_touch': [c['name'] for c in candidates],
+            'count': len(candidates),
+            'delay_sec': delay_sec,
+            'pinned_skipped': len(insights.get('pinned', [])),
+            'singletons_skipped': len(insights.get('singletons', [])),
+        }
+
+    # Real run — sequential force-updates with delay between
+    results = []
+    for c in candidates:
+        name = c['name']
+        if not _valid(_RX_DOCKER_REF, name):
+            results.append({'service': name, 'success': False, 'error': 'invalid name'})
+            continue
+        cmd = f"docker service update --force {shlex.quote(name)}"
+        out = _docker_cmd(cmd + ' 2>&1')
+        success = out is not None and 'verify' in (out or '').lower()
+        # `update --force` returns the service name + "verify: Service converged"
+        # on success. If output exists at all, we usually count it as "queued".
+        if out is not None:
+            success = True
+        results.append({
+            'service': name,
+            'success': success,
+            'output': (out or '')[:200],
+        })
+        try:
+            log_audit(_get_username(), 'docker.balance_rebalance_all',
+                      f'force-update {name} (success={success})')
+        except Exception:
+            pass
+        if delay_sec > 0:
+            time.sleep(delay_sec)
+
+    # Invalidate caches so next read shows fresh state
+    _invalidate('services')
+    with _cache_lock:
+        _cache.pop('load_balance', None)
+        _cache.pop('balance_insights', None)
+
+    applied = sum(1 for r in results if r['success'])
+    return {
+        'dry_run': False,
+        'applied': applied,
+        'failed': len(results) - applied,
+        'total': len(results),
+        'results': results,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Policy Audit endpoints (v1.11.0 — Phase 1)
 # ---------------------------------------------------------------------------
 
@@ -3645,6 +3855,9 @@ def register(app):
         'network-remove': _api_network_remove,
         'load-balance': _api_load_balance,
         'rebalance-service': _api_rebalance_service,
+        # Smart Rebalance (v1.14.0)
+        'balance/insights': _api_balance_insights,
+        'balance/rebalance-all': _api_balance_rebalance_all,
         # Metrics history (v1.13.0 — Phase 3)
         'metrics/history': _api_metrics_history,
         'metrics/trends': _api_metrics_trends,

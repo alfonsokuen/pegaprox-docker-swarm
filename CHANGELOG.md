@@ -4,6 +4,60 @@ All notable changes to the PegaProx Docker Swarm plugin are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This
 project follows Semantic Versioning.
 
+## [1.14.0] — 2026-05-03
+
+Smart rebalance — completes the Balance tab from "what" to "why and how to
+fix it". The previous Balance view told you the score; this release adds a
+diagnosis card explaining *why* the cluster is unbalanced and a one-click
+admin action to force-redistribute eligible services.
+
+### Added — Balance diagnostics + one-click rebalance
+
+A new "Diagnóstico de balance" card in the Balance tab classifies every
+replicated service into three buckets and surfaces actionable guidance:
+
+| Bucket | What it means | Can rebalance? |
+|---|---|---|
+| **Eligible** | replicas≥2, no `node.id`/`node.hostname` constraint pinning | ✓ |
+| **Pinned** | constraint pins to a specific node | ✗ — locked by design |
+| **Singletons** | replicas=1 | ✗ — nothing to distribute |
+
+The diagnosis surfaces:
+- `imbalance_pct` — task-count gap as % of the average
+- hot_node / cold_node — most and least loaded
+- `verdict` — text recommendation tuned to severity (<10%, 10-25%, >25%)
+
+### Added — `POST /balance/rebalance-all`
+
+Admin one-click action. Two-step (dry-run → confirm):
+
+1. **First click** → backend computes the candidate list, returns the plan
+   (`will_touch: [svc1, svc2, …]`, `delay_sec`, count). No mutations.
+2. **Confirmation modal** shows the exact `docker service update --force`
+   commands and estimated total runtime. Click "Ejecutar rebalance" → backend
+   force-updates each eligible service in sequence with the configured delay
+   between (default 5s) so the cluster gets a *rolling* restart wave, never
+   synchronous.
+
+Each force-update is audited individually via `log_audit('docker.balance_
+rebalance_all', …)`. After completion, services + load_balance + insights
+caches are invalidated so the next read shows fresh state.
+
+### Why this matters
+
+Docker Swarm's task scheduler is "best effort": once tasks are placed, it
+doesn't auto-rebalance after the fact. If a node was added later, or services
+were created before `placement.preferences: spread` was added, the cluster
+can run lopsided indefinitely. Before 1.14.0 the fix was: SSH to a manager,
+loop over services, run `docker service update --force` with a manual delay.
+Now it's a button.
+
+The diagnostic card *also* tells you what *can't* be fixed automatically —
+pinned services and singletons — so you don't go looking for a missing
+"why isn't it 100%?" lever.
+
+---
+
 ## [1.13.0] — 2026-05-02
 
 Phase 3 of the durable-cluster-health story: **resource pressure history**.

@@ -1667,6 +1667,16 @@ function NodeBalanceCard({ node: n, maxTasks, rebalancing, onRebalance, history 
 function LoadBalance({ data, toast }) {
   const [rebalancing, setRebalancing] = useState(null);
   const [historyByHost, setHistoryByHost] = useState({});
+  const [insights, setInsights] = useState(null);
+  const [rebalanceAllModal, setRebalanceAllModal] = useState(null); // dry-run plan
+  const [rebalancingAll, setRebalancingAll] = useState(false);
+
+  // Fetch balance insights (why it isn't balancing + which services can move)
+  const refreshInsights = useCallback(async () => {
+    const r = await api('balance/insights');
+    if (!r.error) setInsights(r);
+  }, []);
+  useEffect(() => { refreshInsights(); }, [refreshInsights, data?.updated_at]);
 
   // Fetch 24h history for each node's CPU/RAM/tasks. Done once per data-load
   // (not per render) and merged into a {host: {metric: [points]}} map.
@@ -1712,6 +1722,30 @@ function LoadBalance({ data, toast }) {
     setRebalancing(null);
   };
 
+  // Rebalance-all flow: first call returns dry-run plan, second call executes
+  const doRebalanceAllDryRun = async () => {
+    const r = await api('balance/rebalance-all', {method:'POST', body:{dry_run: true, delay_sec: 5}});
+    if (r._http === 403) { toast('Requiere admin', 'error'); return; }
+    if (r.error) { toast(r.error, 'error'); return; }
+    setRebalanceAllModal(r);
+  };
+
+  const doRebalanceAllConfirm = async () => {
+    if (!rebalanceAllModal) return;
+    const plan = rebalanceAllModal;
+    setRebalanceAllModal(null);
+    setRebalancingAll(true);
+    try {
+      const r = await api('balance/rebalance-all', {method:'POST', body:{dry_run: false, delay_sec: 5}});
+      if (r.error) toast(r.error, 'error');
+      else if (r.applied !== undefined) {
+        toast(`Rebalance: ${r.applied}/${r.total} servicios actualizados`, r.failed > 0 ? 'error' : 'success');
+        refreshInsights();
+      }
+    } catch(e) { toast('Error: ' + (e.message||e), 'error'); }
+    setRebalancingAll(false);
+  };
+
   return <div>
     {/* Score + Summary */}
     <div style={{display:'grid',gridTemplateColumns:'200px 1fr',gap:16,marginBottom:16}}>
@@ -1746,6 +1780,85 @@ function LoadBalance({ data, toast }) {
         </div>}
       </div>
     </div>
+
+    {/* Diagnóstico de balance — porqué no balancea + acción one-click */}
+    {insights && !insights.error && <div className="card" style={{padding:16,marginBottom:16}}>
+      <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',gap:12,marginBottom:12,flexWrap:'wrap'}}>
+        <div>
+          <div style={{fontSize:13,fontWeight:600,marginBottom:4}}>Diagnóstico de balance</div>
+          <div style={{fontSize:13,color:'var(--text)'}}>{insights.verdict}</div>
+        </div>
+        <button className="btn btn-primary"
+          disabled={rebalancingAll || !insights.totals?.eligible}
+          onClick={doRebalanceAllDryRun}>
+          {rebalancingAll ? <span><span className="spinner" style={{width:12,height:12,verticalAlign:'middle',marginRight:4}}/> Rebalanceando…</span>
+            : `⚖ Rebalance automático (${insights.totals?.eligible || 0})`}
+        </button>
+      </div>
+      <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fit, minmax(140px, 1fr))',gap:10,fontSize:12}}>
+        <div style={{padding:'6px 10px',border:'1px solid var(--border)',borderRadius:6}}>
+          <div style={{color:'var(--muted)',fontSize:11,textTransform:'uppercase'}}>Imbalance</div>
+          <div style={{fontWeight:700,fontSize:18,color: insights.imbalance_pct < 10 ? 'var(--green)' : insights.imbalance_pct < 25 ? 'var(--yellow)' : 'var(--red)'}}>
+            {insights.imbalance_pct}%
+          </div>
+        </div>
+        {insights.hot_node && <div style={{padding:'6px 10px',border:'1px solid var(--border)',borderRadius:6}}>
+          <div style={{color:'var(--muted)',fontSize:11,textTransform:'uppercase'}}>Más cargado</div>
+          <div style={{fontWeight:600}}>{insights.hot_node.name}</div>
+          <div style={{color:'var(--muted)',fontSize:11}}>{insights.hot_node.tasks} tasks</div>
+        </div>}
+        {insights.cold_node && <div style={{padding:'6px 10px',border:'1px solid var(--border)',borderRadius:6}}>
+          <div style={{color:'var(--muted)',fontSize:11,textTransform:'uppercase'}}>Menos cargado</div>
+          <div style={{fontWeight:600}}>{insights.cold_node.name}</div>
+          <div style={{color:'var(--muted)',fontSize:11}}>{insights.cold_node.tasks} tasks</div>
+        </div>}
+        <div style={{padding:'6px 10px',border:'1px solid var(--border)',borderRadius:6}}>
+          <div style={{color:'var(--muted)',fontSize:11,textTransform:'uppercase'}}>Elegibles</div>
+          <div style={{fontWeight:700,fontSize:18,color:'var(--accent)'}}>{insights.totals?.eligible || 0}</div>
+          <div style={{color:'var(--muted)',fontSize:10}}>replicas&gt;1, sin pin</div>
+        </div>
+        <div style={{padding:'6px 10px',border:'1px solid var(--border)',borderRadius:6}}>
+          <div style={{color:'var(--muted)',fontSize:11,textTransform:'uppercase'}}>Pinned</div>
+          <div style={{fontWeight:700,fontSize:18,color:'var(--muted)'}}>{insights.totals?.pinned || 0}</div>
+          <div style={{color:'var(--muted)',fontSize:10}}>no se pueden mover</div>
+        </div>
+        <div style={{padding:'6px 10px',border:'1px solid var(--border)',borderRadius:6}}>
+          <div style={{color:'var(--muted)',fontSize:11,textTransform:'uppercase'}}>Singletons</div>
+          <div style={{fontWeight:700,fontSize:18,color:'var(--muted)'}}>{insights.totals?.singletons || 0}</div>
+          <div style={{color:'var(--muted)',fontSize:10}}>replicas=1</div>
+        </div>
+      </div>
+    </div>}
+
+    {/* Confirm modal for rebalance-all */}
+    {rebalanceAllModal && <div className="modal-overlay" onClick={()=>setRebalanceAllModal(null)}>
+      <div className="modal" onClick={e=>e.stopPropagation()} style={{maxWidth:680}}>
+        <div style={{fontSize:16,fontWeight:600,marginBottom:8}}>⚖ Confirmar rebalance automático</div>
+        <div style={{fontSize:12,color:'var(--muted)',marginBottom:12}}>
+          Vas a force-update <strong style={{color:'var(--accent)'}}>{rebalanceAllModal.count}</strong> servicios en secuencia,
+          con <strong>{rebalanceAllModal.delay_sec}s</strong> de pausa entre cada uno. Cada force-update dispara un rolling restart
+          que Swarm aprovecha para redistribuir las réplicas.
+        </div>
+        <div style={{padding:'8px 12px',background:'rgba(255,255,255,.04)',border:'1px solid var(--border)',borderRadius:6,marginBottom:12,fontSize:12}}>
+          <div style={{color:'var(--muted)',marginBottom:4}}>Saltados:</div>
+          <div>· <strong>{rebalanceAllModal.pinned_skipped}</strong> con constraint node.id/hostname (no pueden moverse)</div>
+          <div>· <strong>{rebalanceAllModal.singletons_skipped}</strong> con replicas=1 (no hay nada que distribuir)</div>
+        </div>
+        <div style={{maxHeight:200,overflow:'auto',padding:'6px 10px',background:'#000',border:'1px solid var(--border)',
+          borderRadius:6,marginBottom:12,fontFamily:'monospace',fontSize:11,color:'#0f0'}}>
+          {(rebalanceAllModal.will_touch || []).map(s => <div key={s}>$ docker service update --force {s}</div>)}
+        </div>
+        <div style={{padding:'6px 10px',background:'rgba(234,179,8,.1)',border:'1px solid rgba(234,179,8,.3)',
+          borderRadius:6,fontSize:11,color:'var(--yellow)',marginBottom:16}}>
+          ⚠ Tiempo total estimado: ~{Math.ceil((rebalanceAllModal.count * rebalanceAllModal.delay_sec) / 60)} min.
+          Cada servicio hace rolling update — Swarm mantiene N-1 réplicas vivas durante el cambio.
+        </div>
+        <div style={{display:'flex',gap:8,justifyContent:'flex-end'}}>
+          <button className="btn" onClick={()=>setRebalanceAllModal(null)}>Cancelar</button>
+          <button className="btn btn-primary" onClick={doRebalanceAllConfirm}>Ejecutar rebalance</button>
+        </div>
+      </div>
+    </div>}
 
     {/* Node Cards */}
     <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fit, minmax(360px, 1fr))',gap:16}}>
