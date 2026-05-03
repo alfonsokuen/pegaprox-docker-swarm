@@ -4,6 +4,76 @@ All notable changes to the PegaProx Docker Swarm plugin are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This
 project follows Semantic Versioning.
 
+## [1.14.1] — 2026-05-03
+
+Hotfix to v1.14.0 surfaced by the first real-world rebalance run: each
+`docker service update --force` blocks until convergence (~140 s for a
+3-replica service), so 21 services × ~140 s ≈ 50 min — far longer than
+the nginx `proxy_read_timeout` (60 s default). The browser saw HTTP 499
+and the user got no progress feedback, even though the backend kept
+processing the loop correctly.
+
+### Changed — `POST /balance/rebalance-all` is now async
+
+The endpoint spawns a daemon thread, returns immediately with
+`{job_id, total, started: true}`, and lets the loop run in the
+background. The rolling restarts proceed at the exact same per-service
+pace as before — only the HTTP request returns instantly.
+
+### Added — `GET /balance/rebalance-status[?job_id=X]`
+
+Live job status:
+
+```
+{
+  "job_id": "...",
+  "status": "running" | "completed" | "completed_with_errors",
+  "total": 21,
+  "completed": 6,
+  "failed": 0,
+  "current_service": "idk-microtk_nats",
+  "current_index": 7,
+  "progress_pct": 28.6,
+  "elapsed_sec": 660,
+  "eta_sec": 2340,
+  "started_at": 1735884076,
+  "finished_at": null,
+  "started_by": "alfonso",
+  "results": [{"service": "...", "success": true, "output": "...", "finished_at": ...}, ...]
+}
+```
+
+Without `job_id`, returns the list of all jobs from the last 24 h
+(running + finished). On finish, the job stays visible for 24 h then
+gets pruned lazily on the next `_start_rebalance_job` call.
+
+### UI — live progress card
+
+A new card appears at the top of the Balance tab whenever a rebalance
+job is running or recently finished, showing:
+
+- Status header (running / completed / completed with errors)
+- `completed/total` counter + progress bar
+- Current service in flight
+- Last 6 finished services (✓ green / ✗ red with reason)
+- Elapsed time + ETA estimate (`avg_per_service × remaining`)
+- Hide button once the job finishes
+
+The polling cadence is 3 s. The card auto-resumes if you reload the
+page mid-job — on mount, the UI calls `/balance/rebalance-status` (no
+`job_id`) and re-attaches to any running job it finds.
+
+### Why this matters
+
+Before 1.14.1 the rebalance worked but was invisible: the user had to
+trust that "it's still running somewhere on the backend" and check
+`tasks_running` in the metrics DB to know whether to wait or re-click.
+Now the UI tells you exactly which service is being processed, what's
+done, what's failed, and when it will end. The first real rebalance run
+(21 services, ~50 min) was the forcing function for this fix.
+
+---
+
 ## [1.14.0] — 2026-05-03
 
 Smart rebalance — completes the Balance tab from "what" to "why and how to

@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.14.0-blue" alt="Version"/>
+  <img src="https://img.shields.io/badge/version-1.14.1-blue" alt="Version"/>
   <img src="https://img.shields.io/badge/pegaprox-0.9.0+-orange" alt="PegaProx"/>
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License"/>
   <img src="https://img.shields.io/badge/python-3.8+-yellow" alt="Python"/>
@@ -174,7 +174,8 @@ All endpoints prefixed with `/api/plugins/docker_swarm/api/`
 | GET | `/metrics/history?host=X&metric=cpu_percent&duration=24h` | Time-series for one (host, metric) over the window |
 | GET | `/metrics/trends?duration=24h` | Per-node summary stats (avg/max/current) over the window |
 | GET | `/balance/insights` | Why the cluster isn't balanced + which services can be moved |
-| POST | `/balance/rebalance-all` | Body: `{dry_run, max_services, delay_sec}`. Admin. Force-updates all eligible services in sequence. |
+| POST | `/balance/rebalance-all` | Body: `{dry_run, max_services, delay_sec}`. Admin. Async — returns `{job_id}` immediately; force-updates run in a daemon thread. |
+| GET | `/balance/rebalance-status[?job_id=X]` | Live status of one job (or list of all jobs). Returns progress %, ETA, per-service results. |
 
 ## Requirements
 

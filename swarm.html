@@ -1670,6 +1670,8 @@ function LoadBalance({ data, toast }) {
   const [insights, setInsights] = useState(null);
   const [rebalanceAllModal, setRebalanceAllModal] = useState(null); // dry-run plan
   const [rebalancingAll, setRebalancingAll] = useState(false);
+  const [rebalanceJob, setRebalanceJob] = useState(null);  // {job_id, status, total, completed, ...}
+  const rebalancePollRef = useRef(null);
 
   // Fetch balance insights (why it isn't balancing + which services can move)
   const refreshInsights = useCallback(async () => {
@@ -1730,21 +1732,66 @@ function LoadBalance({ data, toast }) {
     setRebalanceAllModal(r);
   };
 
+  // v1.14.1: backend now spawns a daemon thread and returns {job_id} immediately.
+  // We poll /balance/rebalance-status every 3s to render live progress.
   const doRebalanceAllConfirm = async () => {
     if (!rebalanceAllModal) return;
-    const plan = rebalanceAllModal;
     setRebalanceAllModal(null);
     setRebalancingAll(true);
     try {
       const r = await api('balance/rebalance-all', {method:'POST', body:{dry_run: false, delay_sec: 5}});
-      if (r.error) toast(r.error, 'error');
-      else if (r.applied !== undefined) {
-        toast(`Rebalance: ${r.applied}/${r.total} servicios actualizados`, r.failed > 0 ? 'error' : 'success');
-        refreshInsights();
-      }
-    } catch(e) { toast('Error: ' + (e.message||e), 'error'); }
-    setRebalancingAll(false);
+      if (r.error) { toast(r.error, 'error'); setRebalancingAll(false); return; }
+      if (!r.started || !r.job_id) { toast(r.reason || 'No se pudo iniciar', 'error'); setRebalancingAll(false); return; }
+      // Seed the live job state, kick off polling
+      setRebalanceJob({ job_id: r.job_id, status: 'running', total: r.total, completed: 0,
+                         failed: 0, current_service: null, current_index: 0, results: [],
+                         elapsed_sec: 0, eta_sec: null, progress_pct: 0 });
+      toast(`Rebalance arrancado: ${r.total} servicios`, 'success');
+      const poll = async () => {
+        const s = await api(`balance/rebalance-status?job_id=${encodeURIComponent(r.job_id)}`);
+        if (s.error) return;
+        setRebalanceJob(s);
+        if (s.status === 'running') {
+          rebalancePollRef.current = setTimeout(poll, 3000);
+        } else {
+          setRebalancingAll(false);
+          refreshInsights();
+          const ok = s.failed === 0;
+          toast(`Rebalance ${ok ? 'completo' : 'con errores'}: ${s.completed}/${s.total} (${s.failed} fail)`, ok ? 'success' : 'error');
+        }
+      };
+      poll();
+    } catch(e) { toast('Error: ' + (e.message||e), 'error'); setRebalancingAll(false); }
   };
+
+  // Cleanup polling on unmount
+  useEffect(() => () => { if (rebalancePollRef.current) clearTimeout(rebalancePollRef.current); }, []);
+
+  // On mount, check if there's already a running job (e.g. user reopened the page)
+  useEffect(() => {
+    (async () => {
+      const r = await api('balance/rebalance-status');
+      if (r?.jobs?.length) {
+        const running = r.jobs.find(j => j.status === 'running');
+        if (running) {
+          setRebalancingAll(true);
+          // Hydrate then start polling
+          const poll = async () => {
+            const s = await api(`balance/rebalance-status?job_id=${encodeURIComponent(running.job_id)}`);
+            if (s.error) return;
+            setRebalanceJob(s);
+            if (s.status === 'running') {
+              rebalancePollRef.current = setTimeout(poll, 3000);
+            } else {
+              setRebalancingAll(false);
+              refreshInsights();
+            }
+          };
+          poll();
+        }
+      }
+    })();
+  }, []);
 
   return <div>
     {/* Score + Summary */}
@@ -1782,6 +1829,48 @@ function LoadBalance({ data, toast }) {
     </div>
 
     {/* Diagnóstico de balance — porqué no balancea + acción one-click */}
+    {/* Live progress card — visible whenever there's a running or recently-finished job */}
+    {rebalanceJob && <div className="card" style={{padding:16,marginBottom:16,borderColor:rebalanceJob.status==='running'?'var(--accent)':rebalanceJob.failed>0?'var(--red)':'var(--green)'}}>
+      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8,gap:12,flexWrap:'wrap'}}>
+        <div>
+          <div style={{fontSize:13,fontWeight:600,display:'flex',alignItems:'center',gap:6}}>
+            {rebalanceJob.status === 'running'
+              ? <><span className="spinner" style={{width:14,height:14}}/> Rebalance en curso</>
+              : rebalanceJob.failed > 0 ? '⚠ Rebalance terminado con errores'
+              : '✓ Rebalance completado'}
+          </div>
+          <div style={{fontSize:11,color:'var(--muted)',fontFamily:'monospace',marginTop:2}}>
+            job <strong>{rebalanceJob.job_id}</strong> · started by {rebalanceJob.started_by || '?'}
+          </div>
+        </div>
+        <div style={{textAlign:'right',fontSize:12}}>
+          <div><strong style={{fontSize:18}}>{rebalanceJob.completed}/{rebalanceJob.total}</strong> {rebalanceJob.failed > 0 && <span style={{color:'var(--red)'}}>· {rebalanceJob.failed} fail</span>}</div>
+          <div style={{color:'var(--muted)',fontSize:11}}>
+            {rebalanceJob.status === 'running'
+              ? `${rebalanceJob.progress_pct||0}% · elapsed ${Math.floor((rebalanceJob.elapsed_sec||0)/60)}m${(rebalanceJob.elapsed_sec||0)%60}s${rebalanceJob.eta_sec ? ` · ETA ${Math.floor(rebalanceJob.eta_sec/60)}m${rebalanceJob.eta_sec%60}s` : ''}`
+              : `total ${Math.floor((rebalanceJob.elapsed_sec||0)/60)}m${(rebalanceJob.elapsed_sec||0)%60}s`}
+          </div>
+        </div>
+      </div>
+      {/* Progress bar */}
+      <div style={{height:6,background:'var(--border)',borderRadius:3,overflow:'hidden',marginBottom:10}}>
+        <div style={{
+          width: `${rebalanceJob.progress_pct||0}%`,
+          height: '100%',
+          background: rebalanceJob.failed > 0 ? 'var(--red)' : rebalanceJob.status === 'running' ? 'var(--accent)' : 'var(--green)',
+          transition: 'width .6s ease',
+        }}/>
+      </div>
+      {rebalanceJob.current_service && <div style={{fontSize:12,color:'var(--accent)',marginBottom:8,fontFamily:'monospace'}}>
+        ▶ ahora: <strong>{rebalanceJob.current_service}</strong> ({rebalanceJob.current_index}/{rebalanceJob.total})
+      </div>}
+      {/* Last 6 results */}
+      {(rebalanceJob.results || []).slice(-6).reverse().map((r, i) => <div key={i} style={{fontSize:11,fontFamily:'monospace',color: r.success ? 'var(--green)' : 'var(--red)', marginBottom:2}}>
+        {r.success ? '✓' : '✗'} {r.service} {!r.success && r.error && <span style={{color:'var(--muted)'}}>— {r.error}</span>}
+      </div>)}
+      {rebalanceJob.status !== 'running' && <button className="btn btn-sm" style={{marginTop:8}} onClick={()=>setRebalanceJob(null)}>Ocultar</button>}
+    </div>}
+
     {insights && !insights.error && <div className="card" style={{padding:16,marginBottom:16}}>
       <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',gap:12,marginBottom:12,flexWrap:'wrap'}}>
         <div>

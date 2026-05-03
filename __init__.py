@@ -3266,16 +3266,121 @@ def _api_balance_insights():
     return report
 
 
+# --- Async job machinery (v1.14.1) ----------------------------------------
+# Force-update of N services takes minutes-to-hours because each invocation
+# blocks until Swarm converges. Doing this in the request handler causes
+# nginx 60s timeout / browser disconnect (HTTP 499), even though the work
+# keeps running in pegaprox. We move the loop to a daemon thread, return
+# {job_id} immediately, and expose a status endpoint for UI polling.
+
+_rebalance_jobs = {}
+_rebalance_jobs_lock = threading.Lock()
+_REBALANCE_JOBS_RETENTION_SEC = 86400  # keep finished jobs visible for 24h
+
+
+def _rebalance_jobs_prune():
+    """Drop finished jobs older than retention window. Called opportunistically."""
+    cutoff = time.time() - _REBALANCE_JOBS_RETENTION_SEC
+    with _rebalance_jobs_lock:
+        for jid in list(_rebalance_jobs.keys()):
+            j = _rebalance_jobs[jid]
+            if j.get('finished_at') and j['finished_at'] < cutoff:
+                del _rebalance_jobs[jid]
+
+
+def _start_rebalance_job(candidates, delay_sec, username):
+    """Spawn a daemon thread that force-updates each candidate in sequence.
+    Returns the job_id immediately. Status is observable via _rebalance_jobs."""
+    _rebalance_jobs_prune()
+    job_id = _uuid_mod.uuid4().hex[:16]
+    with _rebalance_jobs_lock:
+        _rebalance_jobs[job_id] = {
+            'job_id': job_id,
+            'status': 'running',
+            'total': len(candidates),
+            'completed': 0,
+            'failed': 0,
+            'current_service': None,
+            'current_index': 0,
+            'results': [],
+            'started_at': time.time(),
+            'finished_at': None,
+            'started_by': username,
+            'queue': [c['name'] for c in candidates],
+        }
+
+    def _worker():
+        for idx, c in enumerate(candidates):
+            name = c['name']
+            with _rebalance_jobs_lock:
+                _rebalance_jobs[job_id]['current_service'] = name
+                _rebalance_jobs[job_id]['current_index'] = idx + 1
+            success = False
+            err = ''
+            output = ''
+            if not _valid(_RX_DOCKER_REF, name):
+                err = 'invalid service name'
+            else:
+                cmd = f"docker service update --force {shlex.quote(name)}"
+                out = _docker_cmd(cmd + ' 2>&1')
+                if out is not None:
+                    success = True
+                    output = (out or '')[:200]
+                else:
+                    err = 'docker_cmd returned None'
+
+            with _rebalance_jobs_lock:
+                _rebalance_jobs[job_id]['results'].append({
+                    'service': name,
+                    'success': success,
+                    'output': output,
+                    'error': err,
+                    'finished_at': time.time(),
+                })
+                _rebalance_jobs[job_id]['completed'] += 1
+                if not success:
+                    _rebalance_jobs[job_id]['failed'] += 1
+
+            try:
+                log_audit(username, 'docker.balance_rebalance_all',
+                          f'force-update {name} (success={success})')
+            except Exception:
+                pass
+
+            if delay_sec > 0 and idx < len(candidates) - 1:
+                time.sleep(delay_sec)
+
+        # Finalize
+        with _rebalance_jobs_lock:
+            j = _rebalance_jobs[job_id]
+            j['current_service'] = None
+            j['finished_at'] = time.time()
+            j['status'] = 'completed' if j['failed'] == 0 else 'completed_with_errors'
+
+        # Invalidate caches so next UI read shows fresh state
+        try:
+            _invalidate('services')
+            with _cache_lock:
+                _cache.pop('load_balance', None)
+                _cache.pop('balance_insights', None)
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_worker, daemon=True, name=f'rebalance-{job_id}')
+    t.start()
+    return job_id
+
+
 def _api_balance_rebalance_all():
-    """POST — Force-update every eligible service in sequence to redistribute.
+    """POST — Plan or kick off a cluster-wide force-update rebalance.
 
     Body:
       dry_run: bool (default true) — return the plan without executing
       max_services: int (default 0 = no cap) — only touch the first N
-      delay_sec: int (default 5) — pause between updates so the cluster
-                 doesn't get a synchronous restart wave
+      delay_sec: int (default 5) — pause between updates
 
-    Admin-only. Returns per-service result + final status.
+    Admin-only. With dry_run=false, returns IMMEDIATELY with a job_id.
+    Poll GET /balance/rebalance-status?job_id=X for progress.
     """
     err = _require_admin()
     if err:
@@ -3304,47 +3409,55 @@ def _api_balance_rebalance_all():
             'singletons_skipped': len(insights.get('singletons', [])),
         }
 
-    # Real run — sequential force-updates with delay between
-    results = []
-    for c in candidates:
-        name = c['name']
-        if not _valid(_RX_DOCKER_REF, name):
-            results.append({'service': name, 'success': False, 'error': 'invalid name'})
-            continue
-        cmd = f"docker service update --force {shlex.quote(name)}"
-        out = _docker_cmd(cmd + ' 2>&1')
-        success = out is not None and 'verify' in (out or '').lower()
-        # `update --force` returns the service name + "verify: Service converged"
-        # on success. If output exists at all, we usually count it as "queued".
-        if out is not None:
-            success = True
-        results.append({
-            'service': name,
-            'success': success,
-            'output': (out or '')[:200],
-        })
-        try:
-            log_audit(_get_username(), 'docker.balance_rebalance_all',
-                      f'force-update {name} (success={success})')
-        except Exception:
-            pass
-        if delay_sec > 0:
-            time.sleep(delay_sec)
+    # Real run — fire-and-forget background thread
+    if not candidates:
+        return {'dry_run': False, 'started': False, 'reason': 'no eligible services'}
 
-    # Invalidate caches so next read shows fresh state
-    _invalidate('services')
-    with _cache_lock:
-        _cache.pop('load_balance', None)
-        _cache.pop('balance_insights', None)
-
-    applied = sum(1 for r in results if r['success'])
+    job_id = _start_rebalance_job(candidates, delay_sec, _get_username())
     return {
         'dry_run': False,
-        'applied': applied,
-        'failed': len(results) - applied,
-        'total': len(results),
-        'results': results,
+        'started': True,
+        'job_id': job_id,
+        'total': len(candidates),
+        'delay_sec': delay_sec,
+        'poll_url': f'/api/plugins/{PLUGIN_ID}/api/balance/rebalance-status?job_id={job_id}',
     }
+
+
+def _api_balance_rebalance_status():
+    """GET — Status of a rebalance job, or list of all jobs if no id."""
+    job_id = request.args.get('job_id', '').strip()
+    with _rebalance_jobs_lock:
+        if job_id:
+            j = _rebalance_jobs.get(job_id)
+            if not j:
+                return {'error': 'job not found', 'job_id': job_id}, 404
+            # Return a copy with derived fields
+            elapsed = time.time() - j['started_at']
+            avg_per_service = (elapsed / max(j['completed'], 1)) if j['completed'] > 0 else 0
+            remaining = max(j['total'] - j['completed'], 0)
+            eta_sec = int(avg_per_service * remaining) if avg_per_service > 0 else None
+            out = dict(j)
+            out['elapsed_sec'] = int(elapsed)
+            out['eta_sec'] = eta_sec
+            out['progress_pct'] = round((j['completed'] / max(j['total'], 1)) * 100, 1)
+            return out
+        # List all jobs (prune first)
+        return {
+            'jobs': sorted(
+                [{
+                    'job_id': j['job_id'],
+                    'status': j['status'],
+                    'total': j['total'],
+                    'completed': j['completed'],
+                    'failed': j['failed'],
+                    'started_at': j['started_at'],
+                    'finished_at': j['finished_at'],
+                    'started_by': j['started_by'],
+                } for j in _rebalance_jobs.values()],
+                key=lambda j: -j['started_at'],
+            ),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -3855,9 +3968,10 @@ def register(app):
         'network-remove': _api_network_remove,
         'load-balance': _api_load_balance,
         'rebalance-service': _api_rebalance_service,
-        # Smart Rebalance (v1.14.0)
+        # Smart Rebalance (v1.14.0 + v1.14.1 async)
         'balance/insights': _api_balance_insights,
         'balance/rebalance-all': _api_balance_rebalance_all,
+        'balance/rebalance-status': _api_balance_rebalance_status,
         # Metrics history (v1.13.0 — Phase 3)
         'metrics/history': _api_metrics_history,
         'metrics/trends': _api_metrics_trends,
