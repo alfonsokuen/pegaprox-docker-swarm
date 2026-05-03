@@ -4,6 +4,31 @@ All notable changes to the PegaProx Docker Swarm plugin are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This
 project follows Semantic Versioning.
 
+## [1.11.1] — 2026-05-02
+
+Hotfix to a real false positive surfaced when reviewing the v1.11.0 audit
+against the live cluster.
+
+### Fixed — `replicas_vs_nodes` check (P0)
+
+The check used to fail any replicated service where `replicas > healthy_nodes`,
+on the assumption that "extra" replicas could not be scheduled. That assumption
+is wrong: Docker Swarm allows multiple replicas on the same node by default.
+Only `max_replicas_per_node` actually caps stacking. The check now:
+
+- Passes whenever `max_replicas_per_node` is unset (Swarm can always
+  stack — replicas > nodes is fine).
+- Passes when `replicas ≤ max_per_node × healthy_nodes`.
+- Fails only when `max_per_node × healthy_nodes < replicas` (genuine
+  scheduling impossibility), with a fix hint that mentions all three
+  remediations: scale down, raise `max_replicas_per_node`, or add nodes.
+
+Live cluster impact: services like `puntual_api` (6 replicas, 3 nodes,
+Spread by `node.id`, no `max_replicas_per_node`) used to grade F because
+of this check. They now correctly grade higher.
+
+---
+
 ## [1.11.0] — 2026-05-02
 
 Phase 1 of the durable-cluster-health story: the **Policy Auditor**. The

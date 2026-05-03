@@ -924,6 +924,12 @@ def _has_spread(svc):
 
 
 def _check_replicas_vs_nodes(svc, ctx):
+    """Replicas can only be 'unschedulable' when max_replicas_per_node forbids
+    stacking — Swarm by default allows multiple replicas on the same node.
+    So this check fails only when max_replicas_per_node × healthy_nodes
+    cannot accommodate the requested replicas. Without max_per_node, the
+    spread preference handles distribution and replicas > nodes is fine.
+    """
     if svc.get('mode_type') != 'replicated':
         return {'status': 'skip', 'message': 'Servicio en modo global o non-replicated.'}
     replicas = svc.get('replicas_spec', 0) or 0
@@ -932,13 +938,32 @@ def _check_replicas_vs_nodes(svc, ctx):
         return {'status': 'skip', 'message': 'Replicas=0 (servicio detenido).'}
     if healthy <= 0:
         return {'status': 'skip', 'message': 'No hay nodos sanos detectados — no se puede evaluar.'}
-    if replicas > healthy:
-        return {
-            'status': 'fail',
-            'message': f'replicas={replicas} > nodos sanos={healthy}. Algunas réplicas nunca se schedulearán.',
-            'fix_hint': f'docker service scale {svc.get("Name")}={healthy}  # o añadir nodos al cluster',
-        }
-    return {'status': 'pass', 'message': f'replicas={replicas} ≤ nodos sanos={healthy}.'}
+    max_per_node = svc.get('placement_max_replicas', 0) or 0
+    if max_per_node:
+        capacity = max_per_node * healthy
+        if replicas > capacity:
+            return {
+                'status': 'fail',
+                'message': (
+                    f'replicas={replicas} > capacidad={capacity} '
+                    f'(max_replicas_per_node={max_per_node} × {healthy} nodos sanos). '
+                    f'{replicas - capacity} réplica(s) nunca podrán schedulearse.'
+                ),
+                'fix_hint': (
+                    f'docker service scale {svc.get("Name")}={capacity}  '
+                    f'# o subí max_replicas_per_node, o añadí nodos al cluster'
+                ),
+            }
+        return {'status': 'pass', 'message': f'replicas={replicas} ≤ capacidad={capacity}.'}
+    # Sin max_replicas_per_node: Swarm puede stackear múltiples réplicas por
+    # nodo, así que replicas > nodos no impide schedulear. Pasa.
+    return {
+        'status': 'pass',
+        'message': (
+            f'replicas={replicas}, nodos sanos={healthy}. Sin max_replicas_per_node, '
+            f'Swarm permite stackear — siempre schedulea.'
+        ),
+    }
 
 
 def _check_anti_affinity(svc, ctx):
