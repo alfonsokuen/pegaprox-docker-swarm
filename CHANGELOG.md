@@ -4,6 +4,87 @@ All notable changes to the PegaProx Docker Swarm plugin are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This
 project follows Semantic Versioning.
 
+## [1.15.0] — 2026-05-06
+
+Compatibility prep for [PegaProx/project-pegaprox#381] (generic plugin
+frontend hook) + first wave of automated quality gates + a hardening fix
+surfaced **by writing those very tests**. Behaviourally a no-op for
+existing installs — the new manifest fields are additive and PegaProx
+≤0.9.x ignores them; the patcher path remains the live integration
+until #381 lands upstream.
+
+### Fixed — regex anchors (defence in depth)
+
+The seven validator regexes (`_RX_DOCKER_REF`, `_RX_STACK_NAME`,
+`_RX_IMAGE_REF`, `_RX_RESOURCE`, `_RX_ENV_ENTRY`, `_RX_HOSTNAME`,
+`_RX_USERNAME`) used `$` as the end anchor. Python's `re` engine treats `$` as "end of string OR before a
+trailing `\n`" by default, so any value ending in a newline (e.g.
+`"servicename\n"`) was passing validation and slipping into shell
+interpolation. `shlex.quote` still neutralised the direct command-
+injection vector, but the trailing newline contaminated audit logs,
+docker `--format` output, and any post-validation use that didn't
+re-quote. All seven anchors switched to `\Z` (strict end of string).
+
+`\r` and `\x00` were already rejected by the character classes inside
+each regex body — the `\Z` switch only newly blocks the trailing-`\n`
+case. New tests pin down both the newly-fixed and the already-correct
+behaviour so neither can regress.
+
+Caught by `tests/test_security.py::test_docker_ref_rejects_injection
+[name\n]`. No production impact known — the plugin only ever consumes
+validated values via `shlex.quote`d shell calls — but the sloppy
+contract is gone.
+
+### Added — manifest declares its frontend up-front
+
+- `has_frontend: true`
+- `frontend_route: "ui"`
+
+When PegaProx surfaces these fields via `list_plugins()` (#381 changes 2+3),
+the dashboard will render the Docker Swarm tab automatically and this
+plugin's entire `patch_dashboard.py` / `patch-pegaprox.sh` (sidebar +
+iframe + topology integration, ~550 LOC) becomes deletable. Until then,
+fields are inert metadata.
+
+The `frontend_route` value matches the existing
+`register_plugin_route(PLUGIN_ID, 'ui', _api_ui)` registration — no API
+shape change.
+
+### Added — `tests/` with security-critical unit coverage
+
+First automated tests in the repo. Targets the two defences that v1.9.4
+introduced and that a regression would turn straight into a CVE:
+
+- **Input validators** (`_RX_DOCKER_REF`, `_RX_STACK_NAME`, `_RX_IMAGE_REF`,
+  `_RX_RESOURCE`, `_RX_ENV_ENTRY`) — accept-valid + reject-injection
+  matrices including shell metacharacters, command substitution, newlines,
+  null bytes, length caps, type confusion.
+- **`_mask_env_list`** — every keyword in `_RX_SENSITIVE_ENV` is exercised,
+  case-insensitivity, unmask=True passthrough, malformed entries, and the
+  `AUTHOR` over-mask documented as intentional (any future tightening of
+  the regex must update that test).
+
+`tests/conftest.py` stubs the PegaProx host modules and dynamically loads
+`__init__.py` as `docker_swarm`, so CI can run with no PegaProx install.
+
+### Added — CI
+
+`.github/workflows/ci.yml` runs `ruff check` + `pytest` on Python 3.10/3.11/3.12
+on every push and PR. `requirements-dev.txt` pins the two dev-only deps.
+
+### Why this matters
+
+Marcus's review on #381 was clean ("happily accepted via PR") for the
+two additive changes; the security-header relaxation needs Nico's call.
+Either way, the plugin should be ready to enchufar zero-touch the moment
+the upstream hook lands. Adding tests + CI also raises the bar to a
+threshold most upstream maintainers expect before merging multi-thousand-
+line plugins as first-class examples of the new hook.
+
+[PegaProx/project-pegaprox#381]: https://github.com/PegaProx/project-pegaprox/issues/381
+
+---
+
 ## [1.14.3] — 2026-05-03
 
 Resilience pass for the auto-patch / persistence layer, surfaced by a

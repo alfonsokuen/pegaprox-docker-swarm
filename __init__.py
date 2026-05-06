@@ -247,15 +247,17 @@ def _metrics_query_trends(duration_sec):
 # ---------------------------------------------------------------------------
 
 # Docker IDs / service-names / container-names / volume / network names
-_RX_DOCKER_REF = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.\-]{0,254}$')
+# NOTE: anchored with \Z (not $) — Python's `$` matches before a trailing \n,
+# which would let "name\n" pass and contaminate shell output / log lines.
+_RX_DOCKER_REF = re.compile(r'\A[A-Za-z0-9][A-Za-z0-9_.\-]{0,254}\Z')
 # Stack names (more restrictive — used in filenames)
-_RX_STACK_NAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_\-]{0,62}$')
+_RX_STACK_NAME = re.compile(r'\A[A-Za-z0-9][A-Za-z0-9_\-]{0,62}\Z')
 # Image refs: registry/path:tag@sha256:digest — broad but safe (no shell metas)
-_RX_IMAGE_REF = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.:/@\-]{0,254}$')
+_RX_IMAGE_REF = re.compile(r'\A[A-Za-z0-9][A-Za-z0-9_.:/@\-]{0,254}\Z')
 # Resource limits: numbers, dots, units (m, M, G, etc.)
-_RX_RESOURCE = re.compile(r'^[0-9.]+[a-zA-Z]{0,3}$')
+_RX_RESOURCE = re.compile(r'\A[0-9.]+[a-zA-Z]{0,3}\Z')
 # Env entry: KEY=value where value can be anything except newlines/null
-_RX_ENV_ENTRY = re.compile(r'^[A-Za-z_][A-Za-z0-9_]{0,127}(=[^\n\x00]*)?$')
+_RX_ENV_ENTRY = re.compile(r'\A[A-Za-z_][A-Za-z0-9_]{0,127}(=[^\n\x00]*)?\Z')
 
 def _valid(rx, s):
     return isinstance(s, str) and bool(rx.match(s))
@@ -2647,12 +2649,12 @@ def _api_save_config():
 
 
 _RX_HOSTNAME = re.compile(
-    r'^(?:[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?'
+    r'\A(?:[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?'
     r'(?:\.[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?)*'
     r'|(?:\d{1,3}\.){3}\d{1,3}'
-    r')$'
+    r')\Z'
 )
-_RX_USERNAME = re.compile(r'^[A-Za-z_][A-Za-z0-9_\-]{0,31}$')
+_RX_USERNAME = re.compile(r'\A[A-Za-z_][A-Za-z0-9_\-]{0,31}\Z')
 
 def _api_test_connection():
     """POST — Test SSH connection to a host. Body: {host, user, key_file?, password?} (admin only)

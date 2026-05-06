@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -r requirements-dev.txt
+      - name: Lint new code (ruff)
+        # Scope limited to tests/ for now — the 4000+ LOC __init__.py
+        # carries pre-existing lint debt (mostly F541) that is out of
+        # scope for the v1.15.0 #381-readiness release. A separate
+        # cleanup pass will widen this to `.`.
+        run: ruff check tests/ --select=E,F,W,B --ignore=E501,E402
+      - name: Tests
+        run: pytest
