@@ -1,0 +1,6 @@
+# Force LF line endings on shell scripts and Python (cross-platform safety
+# for repos cloned/edited on Windows). install.sh runs on Linux only.
+*.sh    text eol=lf
+*.py    text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf

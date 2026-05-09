@@ -4,6 +4,74 @@ All notable changes to the PegaProx Docker Swarm plugin are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This
 project follows Semantic Versioning.
 
+## [1.16.0] — 2026-05-09
+
+Switches integration from the legacy dashboard.js patcher to the **native
+plugin frontend hook** introduced in PegaProx 0.9.9.3
+([PegaProx/project-pegaprox#381]). The manifest fields declared in v1.15.0
+(`has_frontend: true`, `frontend_route: "ui"`) now do real work: PegaProx
+renders the Docker Swarm tab automatically, no `dashboard.js` rewriting
+required. The orchestrator's CSP/X-Frame headers
+(`frame-ancestors 'self'` + `SAMEORIGIN`) are also set by core, so the
+plugin no longer touches `pegaprox/app.py` either.
+
+### BREAKING — `min_pegaprox` bumped 0.9.0 → 0.9.9.3
+
+PegaProx <0.9.9.3 does not expose the plugin frontend hook. Installing
+v1.16.0 against an older host fails fast in `install.sh` with a clear
+message pointing back to v1.15.0 (which still ships the patcher path).
+
+### Removed — ~550 LOC of legacy patching infrastructure
+
+- `patch_dashboard.py` — JSX patcher (sidebar, content panel, topology, state vars).
+- `patch-pegaprox.sh` — orchestrator that ran the JSX patcher + CSP edits +
+  Babel rebuild after every PegaProx update.
+- `auto-patch.sh` — systemd-triggered re-patcher (filesystem watcher).
+- `setup_path_watcher.sh` — installs the `.path` watcher unit on
+  `dashboard.js` / `app.py` / `vms.py`.
+- `setup_persistence.sh` — multi-layer persistence (path watcher + cron
+  fallback + on-boot re-apply).
+- `_deploy_v1.9.5.py` — single-shot dev deploy script (superseded).
+
+The CSP frame-ancestors hardening Marcus mentioned in #381 is now done by
+PegaProx core, not by this plugin. Verified against PegaProx v0.9.9.3 in
+production (LXC 119 IDKmanager cluster).
+
+### Kept — VNC console fixes (still required)
+
+PegaProx 0.9.9 reworked VNC heavily but did **not** fix the `h-[85vh]`
+Tailwind class missing from the precompiled `tailwind.min.css` bundle —
+the modal still collapses to ~73 px without an out-of-tree CSS rule. The
+nginx-layer permanent fix (`patch_nginx_fixes.sh` +
+`setup_nginx_watcher.sh`) is therefore preserved. The Python-side
+console modal patch (`patch_console_modal.py`), VNC ticket passthrough
+(`patch_vnc_auth_context.py`) and noVNC subprotocol (`patch_vnc_subprotocol.py`)
+are kept as documentation/reference for installs not running nginx —
+none are wired in by the new `install.sh`.
+
+### Changed — `install.sh` simplified
+
+Five steps instead of seven: prerequisites → download → SSH key + config
+→ DB enable → optional nginx + permanent CSS fix. No more JSX patching,
+no more CSP rewrites, no more `pegaprox-swarm-patch.path` systemd unit.
+The version-gate at step 1 enforces `min_pegaprox >= 0.9.9.3` before
+anything else runs.
+
+`uninstall.sh` is correspondingly leaner — it still removes legacy
+systemd watchers from earlier installs (idempotent) but does not need
+to revert any patches under v1.16.0+ deployments.
+
+### Migration from v1.15.x or earlier
+
+For PegaProx hosts already running v1.15.x with the patcher path:
+1. Upgrade PegaProx to 0.9.9.3+.
+2. `systemctl disable --now pegaprox-swarm-patch.path
+   pegaprox-swarm-patch.service`.
+3. Restore upstream `dashboard.js` / `index.html` / `app.py` from the
+   PegaProx release tarball (or run the PegaProx update script).
+4. Pull plugin v1.16.0 — the manifest's existing `has_frontend` /
+   `frontend_route` start working immediately.
+
 ## [1.15.0] — 2026-05-06
 
 Compatibility prep for [PegaProx/project-pegaprox#381] (generic plugin

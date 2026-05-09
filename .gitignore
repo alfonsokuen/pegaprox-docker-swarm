@@ -7,3 +7,8 @@ __pycache__/
 *.pyc
 .DS_Store
 _backups/
+
+# v1.16.0 QA tooling — local-only, never committed
+plugin-v1.16.0.tgz
+pve_exec.py
+sftp_push.py

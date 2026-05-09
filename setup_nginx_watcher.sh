@@ -10,7 +10,7 @@
 #   layer 1: nginx sub_filter serves the CSS rule on every request
 #   layer 2: THIS watcher re-wires the include if the main config is rewritten
 #
-# Idempotent. Called by install.sh and patch-pegaprox.sh.
+# Idempotent. Called by install.sh.
 # ============================================================================
 
 set -e
