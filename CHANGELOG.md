@@ -93,6 +93,28 @@ For users who want to point the plugin at a non-swarm Docker host:
 2. Restart PegaProx (`systemctl restart pegaprox`) — within 60s the sidebar
    re-renders with the standalone subset.
 
+### Verified — both modes on the IDKmanager prod cluster (2026-05-09)
+
+**Swarm mode** (LXC 119 on pve1, talking to IAS01-03):
+- `/api/plugins/docker_swarm/api/host-mode` → `{"mode":"swarm","swarm_state":"active"}`
+- Sidebar shows full 12-tab layout, badge `SWARM`.
+- Dashboard renders unchanged: 3 nodes, 84 services, 35 containers, 286 images,
+  IASERVER01 manager, Docker 29.4.0, 16 cores. Identical to v1.16.0 baseline.
+
+**Standalone mode** (LXC 200 on pve2, IP 190.160.10.220, Docker 29.4.3,
+no `swarm init`):
+- `/api/plugins/docker_swarm/api/host-mode` → `{"mode":"standalone","swarm_state":"inactive"}`
+- Sidebar reduced to 6 tabs: Dashboard, Contenedores, Redes, Volumenes,
+  Imagenes, Ajustes. Badge `STANDALONE`. The 6 swarm-only tabs hide.
+- Dashboard renders the friendly "Docker Standalone" notice with suggested
+  tabs.
+- Spot-checked 5 swarm-only endpoints (`services`, `nodes`, `stacks`,
+  `overview`, `balance/insights`) — all return HTTP 422 with the expected
+  `{"error":"swarm-only endpoint","mode":"standalone","hint":"…"}` body.
+- Spot-checked 5 standalone-OK endpoints (`containers`, `images`, `networks`,
+  `volumes`, `host-mode`) — all return HTTP 200 with valid data from the
+  standalone Docker engine.
+
 ## [1.16.0] — 2026-05-09
 
 Switches integration from the legacy dashboard.js patcher to the **native
